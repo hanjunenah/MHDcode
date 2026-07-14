@@ -1,0 +1,7 @@
+mhd2d
+output/
+*.o
+*.dSYM/
+__pycache__/
+*.pyc
+.DS_Store
