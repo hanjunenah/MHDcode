@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import Slider
 
-from plot_results import cell_extent, magnetic_flux_function, padded_limits
+from plot_results import cell_extent, load_plot_metadata, magnetic_flux_function, outline_absorption_layer, padded_limits
 
 
 FIELD_NAMES = (
@@ -23,7 +23,6 @@ DIAGNOSTIC_NAMES = (
     "antenna_energy_injected", "max_abs_antenna_current",
 )
 VELOCITY_LABELS = {"u": "x", "v": "y", "w": "z"}
-MAGNETIC_LABELS = {"Bx": "x", "By": "y", "Bz": "z"}
 ANTENNA_LABELS = {
     "Jx_antenna": "x", "Jy_antenna": "y", "Jz_antenna": "z"
 }
@@ -50,9 +49,38 @@ def load_antenna_results(path: Path):
                 f"{path} has no antenna diagnostics: {', '.join(missing_diagnostics)}"
             )
         fields = {name: source[f"fields/{name}"][:] for name in FIELD_NAMES}
+        if "prescribed_current/Az" in source:
+            potential = source["prescribed_current/Az"][:]
+            expected = (times.size, y.size + 1, x.size + 1)
+            if potential.shape != expected:
+                raise ValueError(
+                    f"Native Az has shape {potential.shape}; expected {expected}"
+                )
+            # The solver evolves this vertex potential directly. Average its
+            # four corners for contours on the existing cell-centered panels.
+            fields["Az"] = 0.25 * (
+                potential[:, :-1, :-1] + potential[:, :-1, 1:]
+                + potential[:, 1:, :-1] + potential[:, 1:, 1:]
+            )
+            # Use the matching face divergence, including for early files
+            # whose stored divB used a second curl of averaged cell fields.
+            dx, dy = float(x[1] - x[0]), float(y[1] - y[0])
+            face_bx = np.diff(potential, axis=1) / dy
+            face_by = -np.diff(potential, axis=2) / dx
+            fields["divB"] = (np.diff(face_bx, axis=2) / dx
+                              + np.diff(face_by, axis=1) / dy)
         diagnostics = {
             name: source[f"diagnostics/{name}"][:] for name in DIAGNOSTIC_NAMES
         }
+        for name in (
+            "solid_constraint_energy", "absorption_energy_exchange", "boundary_energy_outflow",
+            "plasma_energy", "current_drive_energy_correction", "native_magnetic_energy",
+            "magnetic_averaging_energy", "max_current_constraint_error",
+            "max_stage_current_constraint_error", "max_abs_ct_divB",
+            "injection_energy",
+        ):
+            if name in source["diagnostics"]:
+                diagnostics[name] = source[f"diagnostics/{name}"][:]
 
     if times.size == 0:
         raise ValueError(f"{path} contains no output frames")
@@ -86,14 +114,27 @@ def make_figure(
     diagnostics: dict[str, np.ndarray],
     filename: str,
     initial_frame: int,
+    *,
+    boundary_x: str = "periodic",
+    boundary_y: str = "periodic",
+    solid_mask: np.ndarray | None = None,
+    velocity_component: str = "auto",
+    absorption_width: float = 0.0,
+    density_limit: float | None = None,
 ):
+    if density_limit is not None and (not np.isfinite(density_limit) or density_limit <= 0.0):
+        raise ValueError("density_limit must be finite and positive")
+    prescribed_current = "current_drive_energy_correction" in diagnostics
     antenna_name = strongest_component(
         fields, ("Jx_antenna", "Jy_antenna", "Jz_antenna")
     )
-    velocity_name = strongest_perturbation(fields, ("u", "v", "w"))
-    magnetic_name = strongest_perturbation(fields, ("Bx", "By", "Bz"))
+    if velocity_component not in ("auto", "x", "y", "z"):
+        raise ValueError("velocity_component must be auto, x, y, or z")
+    velocity_name = (strongest_perturbation(fields, ("u", "v", "w"))
+                     if velocity_component == "auto"
+                     else {"x": "u", "y": "v", "z": "w"}[velocity_component])
     velocity_perturbation = fields[velocity_name] - fields[velocity_name][0]
-    magnetic_perturbation = fields[magnetic_name] - fields[magnetic_name][0]
+    momentum_density = fields["rho"] * fields[velocity_name]
     _, antenna_y, antenna_x = np.unravel_index(
         int(np.argmax(np.abs(fields[antenna_name]))), fields[antenna_name].shape
     )
@@ -101,7 +142,8 @@ def make_figure(
 
     spatial_panels = (
         (
-            rf"Impressed current $J_{{{ANTENNA_LABELS[antenna_name]},\,\rm ant}}$",
+            ("Prescribed" if prescribed_current else "Impressed")
+            + rf" current $J_{{{ANTENNA_LABELS[antenna_name]},\,\rm ant}}$",
             fields[antenna_name],
         ),
         (
@@ -109,20 +151,27 @@ def make_figure(
             velocity_perturbation,
         ),
         (
-            rf"Magnetic response $\delta B_{MAGNETIC_LABELS[magnetic_name]}$",
-            magnetic_perturbation,
+            rf"Momentum density $\rho v_{VELOCITY_LABELS[velocity_name]}$",
+            momentum_density,
         ),
         (r"Pressure perturbation $\delta p$", fields["p"] - fields["p"][0]),
         (r"Density perturbation $\delta\rho$", fields["rho"] - fields["rho"][0]),
         (r"Magnetic divergence $\nabla\!\cdot\!\mathbf{B}$", fields["divB"]),
         (r"GLM field $\psi$", fields["psi"]),
     )
-    flux_function = magnetic_flux_function(fields["Bx"], fields["By"], x, y)
+    if solid_mask is not None:
+        spatial_panels = tuple(
+            (title, np.ma.array(data, mask=np.broadcast_to(solid_mask, data.shape)) if panel in (1, 2, 3, 4) else data)
+            for panel, (title, data) in enumerate(spatial_panels)
+        )
+    flux_function = (fields["Az"] if "Az" in fields else
+                     magnetic_flux_function(fields["Bx"], fields["By"], x, y,
+                                            boundary_x, boundary_y))
     extent = (*cell_extent(x), *cell_extent(y))
 
     figure, axes = plt.subplots(3, 3, figsize=(16.5, 13))
     figure.subplots_adjust(
-        left=0.055, right=0.96, top=0.92, bottom=0.09, wspace=0.34, hspace=0.32
+        left=0.055, right=0.94, top=0.90, bottom=0.09, wspace=0.48, hspace=0.34
     )
     try:
         figure.canvas.manager.set_window_title("MHD2D antenna results")
@@ -130,16 +179,31 @@ def make_figure(
         pass
 
     images = []
-    for axis, (panel_title, data) in zip(axes.flat[:7], spatial_panels):
+    for panel, (axis, (panel_title, data)) in enumerate(zip(axes.flat[:7], spatial_panels)):
         lower, upper = padded_limits(data, signed=True)
+        extend = "neither"
+        if panel == 4:
+            # Keep a single scale for the entire slider, excluding body
+            # placeholders and clipping thin, dense sheaths near the plates.
+            values = np.ma.asarray(data).compressed()
+            finite = values[np.isfinite(values)]
+            bound = (density_limit if density_limit is not None else
+                     float(np.percentile(np.abs(finite), 98)) if finite.size else 0.0)
+            if bound > 0.0:
+                lower, upper = -bound, bound
+            below, above = np.any(finite < lower), np.any(finite > upper)
+            extend = "both" if below and above else "min" if below else "max" if above else "neither"
         image = axis.imshow(
             data[initial_frame], origin="lower", extent=extent,
             interpolation="nearest", cmap="RdBu_r", vmin=lower, vmax=upper,
             aspect="equal",
         )
         axis.set(title=panel_title, xlabel="x", ylabel="y")
-        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04, extend=extend)
         images.append(image)
+        if solid_mask is not None and np.any(solid_mask):
+            axis.contour(x, y, solid_mask.astype(float), levels=[0.5], colors="0.25", linewidths=0.8)
+        outline_absorption_layer(axis, x, y, boundary_x, boundary_y, absorption_width)
 
     flux_min, flux_max = float(np.min(flux_function)), float(np.max(flux_function))
     if np.isclose(flux_min, flux_max):
@@ -153,21 +217,51 @@ def make_figure(
     kinetic_change = diagnostics["kinetic_energy"] - diagnostics["kinetic_energy"][0]
     thermal_change = diagnostics["thermal_energy"] - diagnostics["thermal_energy"][0]
     injected_energy = diagnostics["antenna_energy_injected"]
+    expected_energy = injected_energy.copy()
+    if prescribed_current:
+        # This is the difference between the powered-body FV reservoir and
+        # native J*Adot work. Adding solid_constraint_energy here would count
+        # the native circuit work twice.
+        expected_energy += diagnostics["current_drive_energy_correction"]
+    elif "solid_constraint_energy" in diagnostics:
+        expected_energy += diagnostics["solid_constraint_energy"]
+    if "absorption_energy_exchange" in diagnostics:
+        expected_energy += diagnostics["absorption_energy_exchange"]
+    if "boundary_energy_outflow" in diagnostics:
+        expected_energy -= diagnostics["boundary_energy_outflow"]
+    if "injection_energy" in diagnostics:
+        expected_energy += diagnostics["injection_energy"]
+    balance_label = (r"$W_{\rm circuit}+C_{\rm drive}+W_{\rm abs}-E_{\rm out}$"
+                     if prescribed_current and "absorbing" in (boundary_x, boundary_y) else
+                     r"$W_{\rm circuit}+C_{\rm drive}-E_{\rm out}$"
+                     if prescribed_current else
+                     r"$W_{\rm ant}+W_{\rm body}+W_{\rm abs}-E_{\rm out}$"
+                     if "absorbing" in (boundary_x, boundary_y) else
+                     r"$W_{\rm ant}+W_{\rm body}-E_{\rm out}$"
+                     if "solid_constraint_energy" in diagnostics or boundary_x != "periodic" or boundary_y != "periodic"
+                     else r"$\int P_{\rm ant}\,dt$")
+    if "injection_energy" in diagnostics and np.any(diagnostics["injection_energy"] != 0.0):
+        balance_label += r" $+E_{\rm feed}$"
     energy_axis.plot(times, total_change, color="black", linewidth=2.0, label=r"$\Delta E$")
     energy_axis.plot(
-        times, injected_energy, color="tab:green", linestyle="--", linewidth=1.8,
-        label=r"$\int P_{\rm ant}\,dt$",
+        times, expected_energy, color="tab:green", linestyle="--", linewidth=1.8,
+        label=balance_label,
     )
     energy_axis.plot(times, magnetic_change, color="tab:blue", label=r"$\Delta E_B$")
     energy_axis.plot(times, kinetic_change, color="tab:orange", label=r"$\Delta E_K$")
     energy_axis.plot(times, thermal_change, color="tab:red", label=r"$\Delta E_{\rm th}$")
+    if prescribed_current:
+        energy_axis.plot(times, injected_energy, color="tab:purple", linestyle=":",
+                         label=r"$W_{\rm circuit}$: native electrical work")
+        energy_axis.plot(times, diagnostics["current_drive_energy_correction"],
+                         color="0.5", linestyle=":", label=r"$C_{\rm drive}$: discrete correction")
     energy_marker = energy_axis.axvline(times[initial_frame], color="0.4", linestyle="--")
     energy_axis.axhline(0.0, color="0.65", linewidth=0.8)
     energy_axis.set(
-        title="Energy changes and antenna work", xlabel="time",
-        ylabel="change in domain-integrated energy",
+        title="Energy changes and external balance", xlabel="time",
+        ylabel="domain energy change",
     )
-    energy_axis.ticklabel_format(axis="y", style="sci", scilimits=(-3, 3))
+    energy_axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
     energy_axis.grid(alpha=0.25)
     energy_axis.legend(fontsize="small")
 
@@ -187,7 +281,7 @@ def make_figure(
         title="Antenna temporal profile and power", xlabel="time",
         ylabel="antenna current at source",
     )
-    power_axis.set_ylabel("domain-integrated antenna power", color="tab:red")
+    power_axis.set_ylabel("native circuit power" if prescribed_current else "antenna power", color="tab:red")
     power_axis.tick_params(axis="y", colors="tab:red")
     power_axis.axhline(0.0, color="tab:red", linewidth=0.7, alpha=0.35)
     drive_axis.grid(alpha=0.25)
@@ -212,7 +306,12 @@ def make_figure(
         drive_marker.set_xdata([times[frame], times[frame]])
         title.set_text(
             f"2-D MHD antenna: t = {times[frame]:.6g}   "
-            f"(frame {frame}/{times.size - 1}, {filename})"
+            f"(frame {frame}/{times.size - 1}, {filename})\n"
+            f"Boundaries: x={boundary_x}, y={boundary_y}"
+            + ("; gray outlines: stationary bodies" if solid_mask is not None and np.any(solid_mask) else "")
+            + (f"; dotted lines: absorber width={absorption_width:g}" if "absorbing" in (boundary_x, boundary_y) else "")
+            + (f"\nPowered-current constraint: max |Jz-Jz_target| = {diagnostics['max_current_constraint_error'][frame]:.3e}"
+               if "max_current_constraint_error" in diagnostics else "")
         )
         figure.canvas.draw_idle()
 
@@ -249,6 +348,10 @@ def parse_arguments() -> argparse.Namespace:
         help="initial frame; negative values count from the end (default: peak antenna current)",
     )
     parser.add_argument("--save", type=Path, help="save the selected frame instead of opening a window")
+    parser.add_argument("--velocity-component", choices=("auto", "x", "y", "z"), default="auto",
+                        help="velocity and momentum-density component; use x for axial thruster flow")
+    parser.add_argument("--density-limit", type=float,
+                        help="symmetric density-perturbation color limit (default: 98th percentile of |delta rho| over all plasma frames)")
     return parser.parse_args()
 
 
@@ -267,7 +370,10 @@ def main() -> None:
         f"t={times[0]:g}..{times[-1]:g}; opening frame {frame}"
     )
     figure, slider = make_figure(
-        x, y, times, fields, diagnostics, arguments.result_file.name, frame
+        x, y, times, fields, diagnostics, arguments.result_file.name, frame,
+        **load_plot_metadata(arguments.result_file),
+        velocity_component=arguments.velocity_component,
+        density_limit=arguments.density_limit,
     )
     figure._time_slider = slider  # type: ignore[attr-defined]
     if arguments.save is not None:

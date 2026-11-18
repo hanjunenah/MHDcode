@@ -52,7 +52,8 @@ def centered_current_ribbon(x, y):
     periodic_distance = np.minimum(distance, grid["lx"] - distance)
     distance = np.abs(y - 0.5 * grid["ly"])
     periodic_distance_y = np.minimum(distance, grid["ly"] - distance)
-    return antenna_amplitude * np.exp(-0.5 * (periodic_distance / antenna_width) ** 2) * np.exp(-0.5 * (periodic_distance_y / antenna_width) ** 2)
+    return antenna_amplitude * np.exp(-0.5 * (periodic_distance / antenna_width) ** 2) \
+        * np.exp(-0.5 * (periodic_distance_y / antenna_width) ** 2)
 
 
 def smooth_pulse(t):

@@ -49,13 +49,18 @@ def load_results(path: Path):
 
 
 def magnetic_flux_function(
-    bx: np.ndarray, by: np.ndarray, x: np.ndarray, y: np.ndarray
+    bx: np.ndarray, by: np.ndarray, x: np.ndarray, y: np.ndarray,
+    boundary_x: str = "periodic", boundary_y: str = "periodic",
 ) -> np.ndarray:
     """Reconstruct A_z with Bx=dA_z/dy and By=-dA_z/dx.
 
     The inversion uses the central-difference symbols used by the solver.  It
     returns the least-squares solenoidal projection if a small div(B) is present.
+    Nonperiodic fields use a least-squares edge-gradient reconstruction with
+    natural boundary conditions instead of periodically extending the field.
     """
+    if boundary_x != "periodic" or boundary_y != "periodic":
+        return boundary_flux_function(bx, by, x, y, boundary_x, boundary_y)
     nx, ny = x.size, y.size
     dx = float(np.median(np.diff(x))) if nx > 1 else 1.0
     dy = float(np.median(np.diff(y))) if ny > 1 else 1.0
@@ -83,8 +88,107 @@ def magnetic_flux_function(
     return flux
 
 
+def _cosine_transform(values: np.ndarray, axis: int, inverse: bool = False) -> np.ndarray:
+    """Unnormalized DCT-II and its inverse, including complex-valued input."""
+    n = values.shape[axis]
+    shape = [1] * values.ndim
+    shape[axis] = n
+    phase = np.exp(0.5j * np.pi * np.arange(n) / n).reshape(shape)
+    first = [slice(None)] * values.ndim
+    first[axis] = slice(0, n)
+    if not inverse:
+        extended = np.concatenate((values, np.flip(values, axis=axis)), axis=axis)
+        return np.fft.fft(extended, axis=axis)[tuple(first)] / phase
+    spectral_shape = list(values.shape)
+    spectral_shape[axis] = 2 * n
+    spectral = np.zeros(spectral_shape, dtype=np.complex128)
+    spectral[tuple(first)] = values * phase
+    tail = [slice(None)] * values.ndim
+    tail[axis] = slice(n + 1, None)
+    nonzero = [slice(None)] * values.ndim
+    nonzero[axis] = slice(1, None)
+    spectral[tuple(tail)] = np.flip((values / phase)[tuple(nonzero)], axis=axis)
+    return np.fft.ifft(spectral, axis=axis)[tuple(first)]
+
+
+def boundary_flux_function(bx, by, x, y, boundary_x, boundary_y):
+    """Fit d_x A=-By and d_y A=Bx on cell-center edges without wrapping open axes.
+
+    A Fourier/cosine diagonalization solves the graph-Laplacian normal
+    equations.  Processing frames individually limits temporary memory.
+    """
+    if boundary_x not in ("periodic", "outflow", "absorbing") or boundary_y not in ("periodic", "outflow", "absorbing"):
+        raise ValueError("Unknown boundary mode for magnetic-flux reconstruction")
+    ny, nx = y.size, x.size
+    dx = float(np.median(np.diff(x))) if nx > 1 else 1.0
+    dy = float(np.median(np.diff(y))) if ny > 1 else 1.0
+    periodic = (boundary_y == "periodic", boundary_x == "periodic")
+    eigenvalues = []
+    for n, spacing, wraps in zip((ny, nx), (dy, dx), periodic):
+        angle = (2.0 if wraps else 1.0) * np.pi * np.arange(n) / n
+        eigenvalues.append(2.0 * (1.0 - np.cos(angle)) / spacing**2)
+    denominator = eigenvalues[0][:, None] + eigenvalues[1][None, :]
+    x_grid, y_grid = np.meshgrid(x - x[0], y - y[0])
+    result = np.empty_like(bx, dtype=float)
+    for frame in range(bx.shape[0]):
+        mean_bx, mean_by = float(bx[frame].mean()), float(by[frame].mean())
+        source = np.zeros((ny, nx))
+        for axis, target, spacing, wraps in (
+            (1, -(by[frame] - mean_by), dx, periodic[1]),
+            (0, bx[frame] - mean_bx, dy, periodic[0]),
+        ):
+            if wraps:
+                edge_gradient = 0.5 * (target + np.roll(target, -1, axis=axis))
+                source += (np.roll(edge_gradient, 1, axis=axis) - edge_gradient) / spacing
+            else:
+                lower, upper = [slice(None)] * 2, [slice(None)] * 2
+                lower[axis], upper[axis] = slice(None, -1), slice(1, None)
+                edge_gradient = 0.5 * (target[tuple(lower)] + target[tuple(upper)])
+                source[tuple(lower)] -= edge_gradient / spacing
+                source[tuple(upper)] += edge_gradient / spacing
+        transformed = source.astype(complex)
+        for axis in (0, 1):
+            transformed = np.fft.fft(transformed, axis=axis) if periodic[axis] else _cosine_transform(transformed, axis)
+        projected = np.zeros_like(transformed)
+        np.divide(transformed, denominator, out=projected, where=denominator > 1e-24)
+        for axis in (1, 0):
+            projected = np.fft.ifft(projected, axis=axis) if periodic[axis] else _cosine_transform(projected, axis, inverse=True)
+        potential = projected.real + mean_bx * y_grid - mean_by * x_grid
+        result[frame] = potential - potential.mean()
+    return result
+
+
+def load_plot_metadata(path: Path) -> dict:
+    """Read optional boundary/body metadata; older outputs remain periodic."""
+    with h5py.File(path, "r") as source:
+        def string_attribute(name):
+            value = source.attrs.get(name, "periodic")
+            return value.decode() if isinstance(value, bytes) else str(value)
+        return {
+            "boundary_x": string_attribute("boundary_x"),
+            "boundary_y": string_attribute("boundary_y"),
+            "solid_mask": source["solid/mask"][:].astype(bool) if "solid/mask" in source else None,
+            "absorption_width": float(source.attrs.get("absorption_width", 0.0)),
+        }
+
+
+def outline_absorption_layer(axis, x, y, boundary_x, boundary_y, width):
+    """Mark the inner edges of the artificial outer buffer."""
+    if width <= 0:
+        return
+    if boundary_x == "absorbing":
+        left, right = cell_extent(x)
+        axis.axvline(left + width, color="0.4", linestyle=":", linewidth=0.8)
+        axis.axvline(right - width, color="0.4", linestyle=":", linewidth=0.8)
+    if boundary_y == "absorbing":
+        lower, upper = cell_extent(y)
+        axis.axhline(lower + width, color="0.4", linestyle=":", linewidth=0.8)
+        axis.axhline(upper - width, color="0.4", linestyle=":", linewidth=0.8)
+
+
 def padded_limits(data: np.ndarray, signed: bool) -> tuple[float, float]:
-    finite = data[np.isfinite(data)]
+    values = data.compressed() if np.ma.isMaskedArray(data) else data
+    finite = values[np.isfinite(values)]
     if finite.size == 0:
         return (-1.0, 1.0)
     if signed:
@@ -128,8 +232,9 @@ def cell_extent(coordinates: np.ndarray) -> tuple[float, float]:
 
 def make_figure(x: np.ndarray, y: np.ndarray, times: np.ndarray,
                 values: dict[str, np.ndarray], energies: dict[str, np.ndarray],
-                filename: str, initial_frame: int):
-    flux_function = magnetic_flux_function(values["Bx"], values["By"], x, y)
+                filename: str, initial_frame: int, *, boundary_x="periodic",
+                boundary_y="periodic", solid_mask=None, absorption_width=0.0):
+    flux_function = magnetic_flux_function(values["Bx"], values["By"], x, y, boundary_x, boundary_y)
     spatial_panels = (
         (r"Out-of-plane current $J_z$", values["Jz"], "RdBu_r", True),
         (r"Vertical velocity $v_y$", values["v"], "RdBu_r", True),
@@ -139,6 +244,11 @@ def make_figure(x: np.ndarray, y: np.ndarray, times: np.ndarray,
         (r"Magnetic divergence $\nabla\!\cdot\!\mathbf{B}$", values["divB"], "RdBu_r", True),
         (r"GLM field $\psi$", values["psi"], "RdBu_r", True),
     )
+    if solid_mask is not None:
+        spatial_panels = tuple(
+            (title, np.ma.array(data, mask=np.broadcast_to(solid_mask, data.shape)) if panel in (1, 2, 3, 4) else data, color_map, signed)
+            for panel, (title, data, color_map, signed) in enumerate(spatial_panels)
+        )
     extent = (*cell_extent(x), *cell_extent(y))
     figure, axes = plt.subplots(3, 3, figsize=(16.5, 13))
     figure.subplots_adjust(left=0.055, right=0.97, top=0.92, bottom=0.09,
@@ -157,6 +267,9 @@ def make_figure(x: np.ndarray, y: np.ndarray, times: np.ndarray,
         axis.set(title=panel_title, xlabel="x", ylabel="y")
         figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
         images.append(image)
+        if solid_mask is not None and np.any(solid_mask):
+            axis.contour(x, y, solid_mask.astype(float), levels=[0.5], colors="0.25", linewidths=0.8)
+        outline_absorption_layer(axis, x, y, boundary_x, boundary_y, absorption_width)
 
     flux_min, flux_max = float(np.min(flux_function)), float(np.max(flux_function))
     if np.isclose(flux_min, flux_max):
@@ -176,28 +289,32 @@ def make_figure(x: np.ndarray, y: np.ndarray, times: np.ndarray,
     energy_axis.grid(alpha=0.25)
     energy_axis.legend()
 
-    sheet_indices, _, reconnection_rates = reconnection_history(
-        flux_function, values["Jz"], times
-    )
     reconnection_axis = axes.flat[8]
-    mean_rate = np.mean(reconnection_rates, axis=0)
-    for sheet_number, (sheet, rate) in enumerate(zip(sheet_indices, reconnection_rates), start=1):
-        reconnection_axis.plot(
-            times, rate, linestyle="--", linewidth=1.1, alpha=0.7,
-            label=rf"sheet {sheet_number} ($y\approx {y[sheet]:.3g}$)",
+    if boundary_x == boundary_y == "periodic" and solid_mask is None:
+        sheet_indices, _, reconnection_rates = reconnection_history(
+            flux_function, values["Jz"], times
         )
-    reconnection_axis.plot(times, mean_rate, color="black", linewidth=2.0, label="sheet mean")
+        mean_rate = np.mean(reconnection_rates, axis=0)
+        for sheet_number, (sheet, rate) in enumerate(zip(sheet_indices, reconnection_rates), start=1):
+            reconnection_axis.plot(
+                times, rate, linestyle="--", linewidth=1.1, alpha=0.7,
+                label=rf"sheet {sheet_number} ($y\approx {y[sheet]:.3g}$)",
+            )
+        reconnection_axis.plot(times, mean_rate, color="black", linewidth=2.0, label="sheet mean")
+        reconnection_axis.set(
+            title=r"Reconnection rate $d\Delta A_z/dt$", xlabel="time",
+            ylabel=r"$d[\max_x(A_z)-\min_x(A_z)]/dt$",
+        )
+        reconnection_axis.legend(fontsize="small")
+    else:
+        reconnection_axis.plot(times, np.ptp(flux_function, axis=(-2, -1)), color="black", linewidth=2.0)
+        reconnection_axis.set(title="Global magnetic-flux range", xlabel="time",
+                              ylabel=r"$\max(A_z)-\min(A_z)$")
     reconnection_marker = reconnection_axis.axvline(
         times[initial_frame], color="0.4", linestyle="--"
     )
     reconnection_axis.axhline(0.0, color="0.6", linewidth=0.8)
-    reconnection_axis.set(
-        title=r"Reconnection rate $d\Delta A_z/dt$",
-        xlabel="time",
-        ylabel=r"$d[\max_x(A_z)-\min_x(A_z)]/dt$",
-    )
     reconnection_axis.grid(alpha=0.25)
-    reconnection_axis.legend(fontsize="small")
     title = figure.suptitle("")
 
     def show_frame(frame: int) -> None:
@@ -214,7 +331,10 @@ def make_figure(x: np.ndarray, y: np.ndarray, times: np.ndarray,
         reconnection_marker.set_xdata([times[frame], times[frame]])
         title.set_text(
             f"2-D MHD: t = {times[frame]:.6g}   "
-            f"(frame {frame}/{times.size - 1}, {filename})"
+            f"(frame {frame}/{times.size - 1}, {filename})\n"
+            f"Boundaries: x={boundary_x}, y={boundary_y}"
+            + ("; gray outlines: stationary bodies" if solid_mask is not None and np.any(solid_mask) else "")
+            + (f"; dotted lines: absorber width={absorption_width:g}" if "absorbing" in (boundary_x, boundary_y) else "")
         )
         figure.canvas.draw_idle()
 
@@ -260,7 +380,8 @@ def main() -> None:
         raise ValueError(f"Frame {arguments.frame} is outside 0..{times.size - 1}")
     print(f"Loaded {times.size} frames on a {x.size} x {y.size} grid, t={times[0]:g}..{times[-1]:g}")
     figure, slider = make_figure(
-        x, y, times, values, energies, arguments.result_file.name, frame
+        x, y, times, values, energies, arguments.result_file.name, frame,
+        **load_plot_metadata(arguments.result_file),
     )
     figure._time_slider = slider  # type: ignore[attr-defined]
     if arguments.save is not None:
