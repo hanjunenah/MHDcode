@@ -22,6 +22,7 @@ SOLVER_DEFAULTS = {
     "cfl": 0.35,
     "diffusion_cfl": 0.45,
     "resistivity": 0.0,
+    "antenna_model": "resistive_impressed",
     "t_end": 1.0,
     "max_steps": 200_000,
     "second_order": True,
@@ -31,11 +32,18 @@ SOLVER_DEFAULTS = {
     "rho_floor": 1.0e-8,
     "p_floor": 1.0e-8,
     "threads": 0,
+    "boundary_x": "periodic",
+    "boundary_y": "periodic",
+    "absorption_width": 0.0,
+    "absorption_rate": 0.5,
+    "absorption_magnetic_diffusivity": 0.05,
 }
 OUTPUT_DEFAULTS = {"file": "output/results.h5", "interval": 0.1}
 FLUID_KEYS = {"rho", "u", "v", "w", "p"}
 ANTENNA_KEYS = {"field", "space_profile", "time_profile", "space_time_profile"}
 ANTENNA_COMPONENT = {"Jx": 0, "Jy": 1, "Jz": 2}
+BOUNDARY_AMBIENT_KEYS = FLUID_KEYS | {"Bx", "By", "Bz"}
+OPTIONAL_METADATA_GROUPS = ("physical_scaling", "antenna_hardware")
 
 
 def load_problem(path: Path) -> ModuleType:
@@ -60,6 +68,54 @@ def checked_dictionary(name: str, supplied: object, allowed: set[str], defaults:
     result = {} if defaults is None else dict(defaults)
     result.update(supplied)
     return result
+
+
+def checked_problem_metadata(problem: ModuleType) -> dict[str, dict]:
+    """Validate scalar SI/design annotations before preparing or launching a run."""
+    metadata = {}
+    for name in OPTIONAL_METADATA_GROUPS:
+        if not hasattr(problem, name):
+            continue
+        supplied = getattr(problem, name)
+        if not isinstance(supplied, Mapping):
+            raise TypeError(f"{name} must be a dictionary of scalar attributes")
+        values = {}
+        for key, value in supplied.items():
+            if not isinstance(key, str) or not key.isascii() or not key.isidentifier():
+                raise ValueError(f"{name} attribute names must be plain identifiers without '/'")
+            label = f"{name}.{key}"
+            if isinstance(value, (bool, np.bool_)):
+                values[key] = bool(value)
+            elif isinstance(value, str):
+                if "\0" in value:
+                    raise ValueError(f"{label} must not contain a null character")
+                values[key] = value
+            elif isinstance(value, (int, np.integer)):
+                if not np.iinfo(np.int64).min <= int(value) <= np.iinfo(np.int64).max:
+                    raise ValueError(f"{label} integer is outside the supported 64-bit range")
+                values[key] = int(value)
+            elif isinstance(value, (float, np.floating)):
+                number = float(value)
+                if not np.isfinite(number):
+                    raise ValueError(f"{label} must be finite")
+                values[key] = number
+            else:
+                raise TypeError(f"{label} must be a scalar number, boolean, or string")
+        metadata[name] = values
+    return metadata
+
+
+def copy_problem_metadata(prepared: Path, output: Path) -> None:
+    """Attach validated annotations to a closed, successfully completed result."""
+    with h5py.File(prepared, "r") as source:
+        names = [name for name in OPTIONAL_METADATA_GROUPS if name in source]
+        if not names:
+            return  # Leave legacy result files completely untouched.
+        with h5py.File(output, "r+") as destination:
+            for name in names:
+                if name in destination:
+                    raise ValueError(f"Solver output already contains metadata group {name}")
+                source.copy(name, destination)
 
 
 def profile_array(value: object, shape: tuple[int, int], name: str) -> np.ndarray:
@@ -194,11 +250,24 @@ def prepare_antennas(
 
 
 def periodic_curl(
-    magnetic: tuple[np.ndarray, np.ndarray, np.ndarray], dx: float, dy: float
+    magnetic: tuple[np.ndarray, np.ndarray, np.ndarray], dx: float, dy: float,
+    boundary_x: str = "periodic", boundary_y: str = "periodic",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Central curl, using wrapped or zero-gradient exterior ghost cells."""
     bx, by, bz = magnetic
-    derivative_x = lambda array: (np.roll(array, -1, axis=1) - np.roll(array, 1, axis=1)) / (2.0 * dx)
-    derivative_y = lambda array: (np.roll(array, -1, axis=0) - np.roll(array, 1, axis=0)) / (2.0 * dy)
+
+    def derivative(array: np.ndarray, axis: int, spacing: float, boundary: str) -> np.ndarray:
+        if boundary == "periodic":
+            return (np.roll(array, -1, axis=axis) - np.roll(array, 1, axis=axis)) / (2.0 * spacing)
+        padding = [(0, 0), (0, 0)]
+        padding[axis] = (1, 1)
+        padded = np.pad(array, padding, mode="edge")
+        forward, backward = [slice(None)] * 2, [slice(None)] * 2
+        forward[axis], backward[axis] = slice(2, None), slice(None, -2)
+        return (padded[tuple(forward)] - padded[tuple(backward)]) / (2.0 * spacing)
+
+    derivative_x = lambda array: derivative(array, 1, dx, boundary_x)
+    derivative_y = lambda array: derivative(array, 0, dy, boundary_y)
     return derivative_y(bz), -derivative_x(bz), derivative_x(by) - derivative_y(bx)
 
 
@@ -242,8 +311,10 @@ def check_current_compatibility(
     dy: float,
     tolerance: float,
     description: str,
+    boundary_x: str = "periodic",
+    boundary_y: str = "periodic",
 ) -> None:
-    calculated = periodic_curl(magnetic, dx, dy)
+    calculated = periodic_curl(magnetic, dx, dy, boundary_x, boundary_y)
     error = max(float(np.max(np.abs(actual - expected))) for actual, expected in zip(calculated, prescribed))
     scale = max(1.0, *(float(np.max(np.abs(component))) for component in prescribed))
     relative_error = error / scale
@@ -259,6 +330,7 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
                   threads_override: int | None) -> Path:
     if not hasattr(problem, "grid") or not hasattr(problem, "initial_state"):
         raise AttributeError("Problem files must define grid and initial_state(x, y)")
+    metadata = checked_problem_metadata(problem)
     grid = checked_dictionary("grid", problem.grid, GRID_KEYS)
     missing_grid = GRID_KEYS - set(grid)
     if missing_grid:
@@ -273,12 +345,50 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
         solver["t_end"] = t_end_override
     if threads_override is not None:
         solver["threads"] = threads_override
+    if solver["antenna_model"] not in ("resistive_impressed", "prescribed_current"):
+        raise ValueError(
+            "solver antenna_model must be 'resistive_impressed' or 'prescribed_current'"
+        )
+    for name in ("boundary_x", "boundary_y"):
+        if solver[name] not in ("periodic", "outflow", "absorbing"):
+            raise ValueError(f"solver {name} must be 'periodic', 'outflow', or 'absorbing'")
+    absorbing = any(solver[name] == "absorbing" for name in ("boundary_x", "boundary_y"))
+    for name in ("absorption_width", "absorption_rate", "absorption_magnetic_diffusivity"):
+        solver[name] = float(solver[name])
+        if not np.isfinite(solver[name]) or solver[name] < 0.0:
+            raise ValueError(f"solver {name} must be finite and non-negative")
+    if absorbing:
+        if solver["absorption_width"] <= 0.0 or solver["absorption_rate"] <= 0.0:
+            raise ValueError("Absorbing boundaries require positive absorption_width and absorption_rate")
+        for axis in ("x", "y"):
+            if solver[f"boundary_{axis}"] == "absorbing" and solver["absorption_width"] >= float(grid[f"l{axis}"]) / 2.0:
+                raise ValueError(f"absorption_width must be smaller than half of the {axis} domain")
+    ambient = None
+    raw_ambient = getattr(problem, "boundary_ambient", None)
+    if absorbing and raw_ambient is None:
+        raise ValueError("Absorbing boundaries require an explicit boundary_ambient dictionary")
+    if raw_ambient is not None:
+        ambient = checked_dictionary("boundary_ambient", raw_ambient, BOUNDARY_AMBIENT_KEYS,
+                                     {name: 0.0 for name in BOUNDARY_AMBIENT_KEYS - {"rho", "p"}})
+        if "rho" not in ambient or "p" not in ambient:
+            raise ValueError("boundary_ambient must provide rho and p")
+        ambient = {name: float(value) for name, value in ambient.items()}
+        if not all(np.isfinite(value) for value in ambient.values()):
+            raise ValueError("boundary_ambient values must be finite")
+        if ambient["rho"] < solver["rho_floor"] or ambient["p"] < solver["p_floor"]:
+            raise ValueError("boundary_ambient rho and p must be positive and meet solver floors")
 
     nx, ny = int(grid["nx"]), int(grid["ny"])
     lx, ly = float(grid["lx"]), float(grid["ly"])
     if nx < 4 or ny < 4 or lx <= 0.0 or ly <= 0.0:
         raise ValueError("Grid dimensions must be positive with at least four cells per direction")
     dx, dy = lx / nx, ly / ny
+    if absorbing and not any(
+        solver[f"boundary_{axis}"] == "absorbing"
+        and solver["absorption_width"] > spacing / 2.0
+        for axis, spacing in (("x", dx), ("y", dy))
+    ):
+        raise ValueError("The absorption width must include at least one active cell center")
     x = (np.arange(nx) + 0.5) * dx
     y = (np.arange(ny) + 0.5) * dy
     x_grid, y_grid = np.meshgrid(x, y)
@@ -295,6 +405,27 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
     if np.min(fluid["rho"]) <= 0.0 or np.min(fluid["p"]) <= 0.0:
         raise ValueError("Initial rho and p must be positive")
 
+    solid_function = getattr(problem, "solid_mask", None)
+    solid = None
+    if solid_function is not None:
+        values = profile_array(evaluate_profile(solid_function, x_grid, y_grid), shape, "solid_mask")
+        if not np.all((values == 0.0) | (values == 1.0)):
+            raise ValueError("solid_mask must contain only booleans or 0/1 values")
+        solid = values.astype(bool)
+        if np.all(solid):
+            raise ValueError("solid_mask must leave at least one plasma cell")
+        if any(np.any(fluid[name][solid] != 0.0) for name in ("u", "v", "w")):
+            raise ValueError("Initial velocity must be zero inside a stationary solid")
+        if absorbing:
+            layer = np.zeros(shape, dtype=bool)
+            width = solver["absorption_width"]
+            if solver["boundary_x"] == "absorbing":
+                layer |= (x_grid < width) | (x_grid > lx - width)
+            if solver["boundary_y"] == "absorbing":
+                layer |= (y_grid < width) | (y_grid > ly - width)
+            if np.any(layer & solid):
+                raise ValueError("The absorption layer must not overlap stationary solid cells")
+
     magnetic_function = getattr(problem, "magnetic_field", None)
     current_function = getattr(problem, "current_density", None)
     tolerance = float(getattr(problem, "current_tolerance", 1.0e-8))
@@ -309,14 +440,26 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
     if magnetic is None and current is None:
         magnetic = tuple(np.zeros(shape) for _ in range(3))
     elif magnetic is None:
+        if solver["boundary_x"] != "periodic" or solver["boundary_y"] != "periodic":
+            raise ValueError(
+                "FFT initialization from current_density requires periodic boundaries; "
+                "provide magnetic_field(x, y) for a nonperiodic domain"
+            )
         mean = tuple(float(value) for value in getattr(problem, "mean_magnetic_field", (0.0, 0.0, 0.0)))
         if len(mean) != 3:
             raise ValueError("mean_magnetic_field must have three values")
         magnetic = magnetic_field_from_current(current, dx, dy, mean, tolerance)  # type: ignore[arg-type]
     elif current is not None:
-        check_current_compatibility(magnetic, current, dx, dy, tolerance, "prescribed B")
+        check_current_compatibility(
+            magnetic, current, dx, dy, tolerance, "prescribed B",
+            solver["boundary_x"], solver["boundary_y"],
+        )
 
     with h5py.File(filename, "w") as destination:
+        for name, values in metadata.items():
+            group = destination.create_group(name)
+            for key, value in values.items():
+                group.attrs[key] = value
         config_group = destination.create_group("config")
         config_values = {**grid, **solver, "output_interval": output["interval"]}
         for key, value in config_values.items():
@@ -326,6 +469,18 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
             initial_group.create_dataset(name, data=values)
         for name, values in zip(("Bx", "By", "Bz"), magnetic):
             initial_group.create_dataset(name, data=values)
+        if solid is not None and np.any(solid):
+            solid_group = destination.create_group("solid")
+            solid_group.create_dataset("mask", data=solid.astype(np.float64))
+            solid_group.attrs["model"] = (
+                "stationary slip wall with powered prescribed-current magnetic coupling"
+                if solver["antenna_model"] == "prescribed_current" else
+                "stationary slip wall with uniform-resistivity magnetic diffusion"
+            )
+        if ambient is not None:
+            ambient_group = destination.create_group("boundary/ambient")
+            for name, value in ambient.items():
+                ambient_group.attrs[name] = value
         prepare_antennas(problem, destination, x_grid, y_grid, shape, float(solver["t_end"]))
     return Path(output["file"])
 
@@ -358,6 +513,7 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         print(f"Launching {executable} -> {output}", flush=True)
         subprocess.run([str(executable), str(prepared), str(output)], check=True)
+        copy_problem_metadata(prepared, output)
 
 
 if __name__ == "__main__":

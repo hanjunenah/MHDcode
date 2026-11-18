@@ -6,12 +6,13 @@ LDLIBS += $(shell $(PKG_CONFIG) --libs hdf5) -pthread
 
 TARGET := mhd2d
 SOURCES := src/main.cpp
+HEADERS := $(wildcard src/*.hpp)
 
 .PHONY: all clean test
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES)
+$(TARGET): $(SOURCES) $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(SOURCES) $(LDLIBS) -o $@
 
 test: $(TARGET)

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -20,6 +21,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "prescribed_current.hpp"
 
 namespace {
 
@@ -36,6 +39,7 @@ struct Config {
     double cfl = 0.35;
     double diffusion_cfl = 0.45;
     double resistivity = 0.0;
+    std::string antenna_model = "resistive_impressed";
     double t_end = 0.0;
     int max_steps = 0;
     bool second_order = true;
@@ -46,6 +50,12 @@ struct Config {
     double p_floor = 1.0e-8;
     double output_interval = 0.1;
     int requested_threads = 0;
+    std::string boundary_x = "periodic";
+    std::string boundary_y = "periodic";
+    double absorption_width = 0.0;
+    double absorption_rate = 0.5;
+    double absorption_magnetic_diffusivity = 0.05;
+    std::array<double, 8> ambient = {1.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 };
 
 struct InitialData {
@@ -63,6 +73,7 @@ struct SolverInput {
     Config config;
     InitialData initial;
     AntennaData antenna;
+    std::vector<double> solid_mask;
 };
 
 std::string format_wall_time(double seconds) {
@@ -104,6 +115,42 @@ T read_attribute(hid_t object, const char* name) {
     T value{};
     const herr_t status = H5Aread(attribute, h5_native_type<T>(), &value);
     H5Aclose(attribute);
+    h5_check(status, std::string("reading attribute ") + name);
+    return value;
+}
+
+template <typename T>
+T read_optional_attribute(hid_t object, const char* name, T fallback) {
+    const htri_t exists = H5Aexists(object, name);
+    h5_check(exists, std::string("checking attribute ") + name);
+    return exists > 0 ? read_attribute<T>(object, name) : fallback;
+}
+
+std::string read_optional_string_attribute(hid_t object, const char* name,
+                                           const std::string& fallback) {
+    const htri_t exists = H5Aexists(object, name);
+    h5_check(exists, std::string("checking attribute ") + name);
+    if (exists == 0) return fallback;
+    const hid_t attribute = h5_id(H5Aopen(object, name, H5P_DEFAULT),
+                                  std::string("opening attribute ") + name);
+    const hid_t type = h5_id(H5Aget_type(attribute), "getting string attribute type");
+    if (H5Tget_class(type) != H5T_STRING) {
+        H5Tclose(type); H5Aclose(attribute);
+        throw std::runtime_error(std::string(name) + " must be a string");
+    }
+    std::string value;
+    herr_t status = 0;
+    if (H5Tis_variable_str(type) > 0) {
+        char* buffer = nullptr;
+        status = H5Aread(attribute, type, &buffer);
+        if (status >= 0 && buffer != nullptr) value = buffer;
+        if (buffer != nullptr) H5free_memory(buffer);
+    } else {
+        std::vector<char> buffer(H5Tget_size(type) + 1, '\0');
+        status = H5Aread(attribute, type, buffer.data());
+        if (status >= 0) value = buffer.data();
+    }
+    H5Tclose(type); H5Aclose(attribute);
     h5_check(status, std::string("reading attribute ") + name);
     return value;
 }
@@ -210,6 +257,7 @@ SolverInput read_solver_input(const std::string& filename) {
     c.cfl = read_attribute<double>(group, "cfl");
     c.diffusion_cfl = read_attribute<double>(group, "diffusion_cfl");
     c.resistivity = read_attribute<double>(group, "resistivity");
+    c.antenna_model = read_optional_string_attribute(group, "antenna_model", "resistive_impressed");
     c.t_end = read_attribute<double>(group, "t_end");
     c.max_steps = read_attribute<int>(group, "max_steps");
     c.second_order = read_attribute<int>(group, "second_order") != 0;
@@ -220,7 +268,27 @@ SolverInput read_solver_input(const std::string& filename) {
     c.p_floor = read_attribute<double>(group, "p_floor");
     c.output_interval = read_attribute<double>(group, "output_interval");
     c.requested_threads = read_attribute<int>(group, "threads");
+    c.boundary_x = read_optional_string_attribute(group, "boundary_x", "periodic");
+    c.boundary_y = read_optional_string_attribute(group, "boundary_y", "periodic");
+    c.absorption_width = read_optional_attribute<double>(group, "absorption_width", 0.0);
+    c.absorption_rate = read_optional_attribute<double>(group, "absorption_rate", 0.5);
+    c.absorption_magnetic_diffusivity = read_optional_attribute<double>(group, "absorption_magnetic_diffusivity", 0.05);
     H5Gclose(group);
+
+    const bool absorbing = c.boundary_x == "absorbing" || c.boundary_y == "absorbing";
+    const htri_t boundary_group_exists = H5Lexists(file, "/boundary", H5P_DEFAULT);
+    h5_check(boundary_group_exists, "checking for /boundary");
+    const htri_t ambient_exists = boundary_group_exists > 0 ? H5Lexists(file, "/boundary/ambient", H5P_DEFAULT) : 0;
+    h5_check(ambient_exists, "checking for /boundary/ambient");
+    if (absorbing && ambient_exists == 0) {
+        throw std::runtime_error("Absorbing boundaries require an explicit /boundary/ambient state");
+    }
+    if (ambient_exists > 0) {
+        const hid_t ambient_group = h5_id(H5Gopen2(file, "/boundary/ambient", H5P_DEFAULT), "opening ambient state");
+        const std::array<const char*, 8> names = {"rho", "p", "u", "v", "w", "Bx", "By", "Bz"};
+        for (std::size_t k = 0; k < names.size(); ++k) c.ambient[k] = read_attribute<double>(ambient_group, names[k]);
+        H5Gclose(ambient_group);
+    }
 
     InitialData initial;
     initial.rho = read_2d_dataset(file, "/initial/rho", c.ny, c.nx);
@@ -242,10 +310,53 @@ SolverInput read_solver_input(const std::string& filename) {
         antenna.jy = read_3d_dataset(file, "/antenna/Jy", antenna.time.size(), c.ny, c.nx);
         antenna.jz = read_3d_dataset(file, "/antenna/Jz", antenna.time.size(), c.ny, c.nx);
     }
+    std::vector<double> solid_mask;
+    const htri_t solid_group_exists = H5Lexists(file, "/solid", H5P_DEFAULT);
+    h5_check(solid_group_exists, "checking for /solid");
+    const htri_t solid_exists = solid_group_exists > 0 ? H5Lexists(file, "/solid/mask", H5P_DEFAULT) : 0;
+    h5_check(solid_exists, "checking for /solid/mask");
+    if (solid_exists > 0) {
+        solid_mask = read_2d_dataset(file, "/solid/mask", c.ny, c.nx);
+        bool any_solid = false, any_fluid = false;
+        for (std::size_t cell = 0; cell < solid_mask.size(); ++cell) {
+            if (solid_mask[cell] != 0.0 && solid_mask[cell] != 1.0) {
+                throw std::runtime_error("solid mask values must be exactly zero or one");
+            }
+            if (solid_mask[cell] == 1.0) {
+                any_solid = true;
+                if (initial.u[cell] != 0.0 || initial.v[cell] != 0.0 || initial.w[cell] != 0.0) {
+                    throw std::runtime_error("Initial velocity inside a stationary solid must be zero");
+                }
+            } else {
+                any_fluid = true;
+            }
+        }
+        if (!any_fluid) throw std::runtime_error("The solid mask must leave at least one fluid cell");
+        if (!any_solid) solid_mask.clear();
+    }
     H5Fclose(file);
 
     if (c.nx < 4 || c.ny < 4 || c.lx <= 0.0 || c.ly <= 0.0) {
         throw std::runtime_error("The grid must have at least 4 cells per direction and positive lengths");
+    }
+    if ((c.boundary_x != "periodic" && c.boundary_x != "outflow" && c.boundary_x != "absorbing") ||
+        (c.boundary_y != "periodic" && c.boundary_y != "outflow" && c.boundary_y != "absorbing")) {
+        throw std::runtime_error("boundary_x and boundary_y must be periodic, outflow, or absorbing");
+    }
+    if (!std::isfinite(c.absorption_width) || !std::isfinite(c.absorption_rate) ||
+        !std::isfinite(c.absorption_magnetic_diffusivity) || c.absorption_width < 0.0 ||
+        c.absorption_rate < 0.0 || c.absorption_magnetic_diffusivity < 0.0) {
+        throw std::runtime_error("Absorption width, rate and magnetic diffusivity must be finite and non-negative");
+    }
+    if (absorbing && (c.absorption_width <= 0.0 || c.absorption_rate <= 0.0 ||
+        (c.boundary_x == "absorbing" && 2.0 * c.absorption_width >= c.lx) ||
+        (c.boundary_y == "absorbing" && 2.0 * c.absorption_width >= c.ly))) {
+        throw std::runtime_error("Absorbing boundaries require positive width/rate and width below half the absorbing domain extent");
+    }
+    if ((absorbing || ambient_exists > 0) &&
+        (!std::all_of(c.ambient.begin(), c.ambient.end(), [](double v) { return std::isfinite(v); }) ||
+         c.ambient[0] < c.rho_floor || c.ambient[1] < c.p_floor)) {
+        throw std::runtime_error("Ambient state must be finite with density/pressure above the floors");
     }
     if (c.gamma <= 1.0 || c.cfl <= 0.0 || c.cfl >= 1.0 || c.diffusion_cfl <= 0.0 ||
         c.diffusion_cfl >= 0.5 || c.resistivity < 0.0) {
@@ -278,7 +389,7 @@ SolverInput read_solver_input(const std::string& filename) {
             throw std::runtime_error("Antenna current table contains a non-finite value");
         }
     }
-    return {c, std::move(initial), std::move(antenna)};
+    return {c, std::move(initial), std::move(antenna), std::move(solid_mask)};
 }
 
 class ParallelExecutor {
@@ -367,23 +478,65 @@ private:
 class Hdf5Output {
 public:
     Hdf5Output(const std::string& filename, const Config& c, const AntennaData& antenna,
-               int threads_used)
+               int threads_used, const std::vector<double>& solid_mask)
         : nx_(c.nx), ny_(c.ny) {
         const std::filesystem::path path(filename);
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
         file_ = h5_id(H5Fcreate(filename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT),
                       "creating output file " + filename);
         write_attribute<int>(file_, "format_version", 3);
-        write_string_attribute(file_, "model", "dimensionless 2.5-D driven resistive GLM-MHD");
+        write_string_attribute(file_, "model", c.antenna_model == "prescribed_current" ?
+            "dimensionless planar resistive CT-MHD with powered prescribed-current bodies" :
+            "dimensionless 2.5-D driven resistive GLM-MHD");
         write_attribute<int>(file_, "nx", c.nx); write_attribute<int>(file_, "ny", c.ny);
         write_attribute<double>(file_, "lx", c.lx); write_attribute<double>(file_, "ly", c.ly);
         write_attribute<double>(file_, "gamma", c.gamma);
         write_attribute<double>(file_, "resistivity", c.resistivity);
+        write_string_attribute(file_, "antenna_model", c.antenna_model);
+        write_string_attribute(file_, "divB_definition", c.antenna_model == "prescribed_current" ?
+            "finite-volume divergence of native CT normal face fields" :
+            "centered derivative of cell-centered magnetic fields");
+        write_string_attribute(file_, "boundary_x", c.boundary_x);
+        write_string_attribute(file_, "boundary_y", c.boundary_y);
+        write_attribute<double>(file_, "absorption_width", c.absorption_width);
+        write_attribute<double>(file_, "absorption_rate", c.absorption_rate);
+        write_attribute<double>(file_, "absorption_magnetic_diffusivity", c.absorption_magnetic_diffusivity);
+        if (c.boundary_x == "absorbing" || c.boundary_y == "absorbing") {
+            write_string_attribute(file_, "absorption_model",
+                "ambient HLLD far-field flux plus smooth fluid relaxation and divergence-preserving curl-form magnetic diffusion sponge; not a perfectly matched layer");
+            write_string_attribute(file_, "absorption_energy_definition",
+                "signed energy supplied to the computational domain by the artificial absorber; magnetic damping preserves local thermal pressure");
+            const hid_t boundary_group = h5_id(H5Gcreate2(file_, "boundary", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "creating boundary group");
+            const hid_t ambient_group = h5_id(H5Gcreate2(boundary_group, "ambient", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "creating ambient group");
+            const std::array<const char*, 8> names = {"rho", "p", "u", "v", "w", "Bx", "By", "Bz"};
+            for (std::size_t k = 0; k < names.size(); ++k) write_attribute<double>(ambient_group, names[k], c.ambient[k]);
+            H5Gclose(ambient_group); H5Gclose(boundary_group);
+        }
         write_attribute<int>(file_, "threads_used", threads_used);
         write_attribute<int>(file_, "antenna_enabled", antenna.enabled() ? 1 : 0);
         const double antenna_sample_interval = antenna.sample_count() > 1
             ? antenna.time[1] - antenna.time[0] : 0.0;
         write_attribute<double>(file_, "antenna_sample_interval", antenna_sample_interval);
+        write_attribute<int>(file_, "solid_enabled", solid_mask.empty() ? 0 : 1);
+        if (!solid_mask.empty()) {
+            write_string_attribute(file_, "solid_model",
+                c.antenna_model == "prescribed_current" ?
+                "stationary impermeable powered body; prescribed native current; nonuniform Az and penetrating magnetic field" :
+                "stationary impermeable slip body; magnetic field penetrates with uniform finite resistivity; not a perfect conductor");
+            write_string_attribute(file_, "solid_energy_accounting",
+                "body rho and thermal pressure are fixed placeholders; solid_constraint_energy is energy supplied by the constraint reservoir");
+            write_string_attribute(file_, "solid_force_definition",
+                "last RK2 step-average force of plasma and magnetic traction on the fixed body; support reaction is its negative");
+            const hid_t group = h5_id(H5Gcreate2(file_, "solid", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT),
+                                       "creating solid group");
+            const hsize_t dimensions[2] = {static_cast<hsize_t>(ny_), static_cast<hsize_t>(nx_)};
+            const hid_t space = h5_id(H5Screate_simple(2, dimensions, nullptr), "creating solid mask space");
+            const hid_t dataset = h5_id(H5Dcreate2(group, "mask", H5T_IEEE_F64LE, space,
+                H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "creating solid mask");
+            h5_check(H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                              solid_mask.data()), "writing solid mask");
+            H5Dclose(dataset); H5Sclose(space); H5Gclose(group);
+        }
 
         std::vector<double> x(static_cast<std::size_t>(nx_)), y(static_cast<std::size_t>(ny_));
         for (int i = 0; i < nx_; ++i) x[static_cast<std::size_t>(i)] = (i + 0.5) * c.lx / nx_;
@@ -403,6 +556,45 @@ public:
             diagnostic_datasets_[name] = create_series(name, diagnostics_group);
         }
         H5Gclose(diagnostics_group);
+        if (c.antenna_model == "prescribed_current") {
+            const hid_t group = h5_id(H5Gcreate2(file_, "prescribed_current", H5P_DEFAULT,
+                H5P_DEFAULT, H5P_DEFAULT), "creating prescribed current group");
+            write_string_attribute(group, "definition",
+                "vertex Az; Bx=d_y Az, By=-d_x Az on faces; Jz=-Lap_h Az on vertex dual volumes; target is conservative quarter-sum of adjacent cell commands");
+            write_string_attribute(group, "energy_definition",
+                "antenna work is sum Jz_target*Adot*dx*dy; solid_constraint_energy includes the powered-body FV energy reset; current_drive_energy_correction=solid_constraint_energy-antenna_energy_injected; do not add both solid constraint and antenna work in a budget");
+            write_string_attribute(group, "energy_correction_definition",
+                "source/body spatial-coupling error, distinct from face-versus-cell magnetic averaging; a closed reservoir budget alone does not establish convergence of circuit power");
+            write_string_attribute(group, "geometry_definition",
+                "powered nodes are the union of solid-cell corners, including zero-target nodes; electromagnetic dual volumes extend half a cell beyond mechanical body");
+            write_string_attribute(group, "power_definition",
+                "antenna_power is the last RK2 step-average native electrical power; antenna_energy_injected is its time integral");
+            const PrescribedCurrentOperator op(c.nx, c.ny, c.lx / c.nx, c.ly / c.ny, solid_mask);
+            std::vector<double> mask(op.node_count());
+            for (std::size_t n = 0; n < mask.size(); ++n) mask[n] = op.powered_mask()[n];
+            const int old_nx = nx_, old_ny = ny_;
+            nx_++; ny_++;
+            for (const std::string name : {"Az", "Jz", "Jz_target"})
+                node_datasets_[name] = create_field(group, name);
+            const hsize_t dims[2] = {static_cast<hsize_t>(ny_), static_cast<hsize_t>(nx_)};
+            const hid_t space = h5_id(H5Screate_simple(2, dims, nullptr), "creating powered mask space");
+            const hid_t dataset = h5_id(H5Dcreate2(group, "powered_mask", H5T_IEEE_F64LE,
+                space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "creating powered mask");
+            h5_check(H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, mask.data()), "writing powered mask");
+            H5Dclose(dataset); H5Sclose(space);
+            nx_ = old_nx; ny_ = old_ny;
+            std::vector<double> xn(c.nx + 1), yn(c.ny + 1);
+            for (int i = 0; i <= c.nx; ++i) xn[i] = i * c.lx / c.nx;
+            for (int j = 0; j <= c.ny; ++j) yn[j] = j * c.ly / c.ny;
+            write_fixed_1d("prescribed_current/x", xn);
+            write_fixed_1d("prescribed_current/y", yn);
+            const hid_t diagnostic_group = h5_id(H5Gopen2(file_, "diagnostics", H5P_DEFAULT), "opening diagnostics");
+            for (const std::string name : {"max_current_constraint_error", "max_stage_current_constraint_error",
+                 "max_abs_ct_divB", "native_magnetic_energy", "magnetic_averaging_energy", "current_drive_energy_correction"})
+                diagnostic_datasets_[name] = create_series(name, diagnostic_group);
+            H5Gclose(diagnostic_group);
+            H5Gclose(group);
+        }
     }
 
     Hdf5Output(const Hdf5Output&) = delete;
@@ -411,12 +603,14 @@ public:
     ~Hdf5Output() {
         for (auto& item : field_datasets_) H5Dclose(item.second);
         for (auto& item : diagnostic_datasets_) H5Dclose(item.second);
+        for (auto& item : node_datasets_) H5Dclose(item.second);
         if (time_dataset_ >= 0) H5Dclose(time_dataset_);
         if (file_ >= 0) H5Fclose(file_);
     }
 
     void append(double time, const std::map<std::string, std::vector<double>>& fields,
-                const std::map<std::string, double>& diagnostics) {
+                const std::map<std::string, double>& diagnostics,
+                const std::map<std::string, std::vector<double>>& nodes = {}) {
         append_scalar(time_dataset_, time);
         for (const auto& item : field_datasets_) {
             const auto found = fields.find(item.first);
@@ -427,6 +621,11 @@ public:
             const auto found = diagnostics.find(item.first);
             if (found == diagnostics.end()) throw std::runtime_error("Missing diagnostic " + item.first);
             append_scalar(item.second, found->second);
+        }
+        if (!node_datasets_.empty()) {
+            nx_++; ny_++;
+            for (const auto& item : node_datasets_) append_field(item.second, nodes.at(item.first));
+            nx_--; ny_--;
         }
         ++frame_;
         h5_check(H5Fflush(file_, H5F_SCOPE_LOCAL), "flushing output file");
@@ -439,6 +638,7 @@ private:
     hsize_t frame_ = 0;
     std::map<std::string, hid_t> field_datasets_;
     std::map<std::string, hid_t> diagnostic_datasets_;
+    std::map<std::string, hid_t> node_datasets_;
 
     static const std::vector<std::string>& field_names() {
         static const std::vector<std::string> names = {
@@ -454,7 +654,13 @@ private:
             "magnetic_flux_x", "magnetic_flux_y", "magnetic_flux_z", "glm_integral",
             "entropy_integral", "total_energy", "magnetic_energy", "kinetic_energy", "thermal_energy",
             "antenna_power", "antenna_energy_injected", "max_abs_antenna_current",
-            "max_speed", "max_abs_divB", "l1_divB", "max_abs_By", "min_rho", "min_p"
+            "max_speed", "max_abs_divB", "l1_divB", "max_abs_By", "min_rho", "min_p",
+            "plasma_mass", "plasma_energy", "plasma_magnetic_energy", "plasma_kinetic_energy",
+            "plasma_thermal_energy", "solid_magnetic_energy", "solid_constraint_energy",
+            "boundary_energy_outflow", "boundary_mass_outflow", "solid_force_x", "solid_force_y",
+            "solid_force_z", "solid_impulse_x", "solid_impulse_y", "solid_impulse_z", "max_wall_mass_flux",
+            "absorption_energy_exchange", "absorption_mass_exchange",
+            "absorption_momentum_exchange_x", "absorption_momentum_exchange_y", "absorption_momentum_exchange_z"
         };
         return names;
     }
@@ -539,15 +745,53 @@ struct Primitive {
 
 class Solver {
 public:
-    Solver(Config config, InitialData initial, AntennaData antenna)
+    Solver(Config config, InitialData initial, AntennaData antenna, std::vector<double> solid_mask)
         : c_(std::move(config)), dx_(c_.lx / c_.nx), dy_(c_.ly / c_.ny),
+          periodic_x_(c_.boundary_x == "periodic"), periodic_y_(c_.boundary_y == "periodic"),
+          absorbing_(c_.boundary_x == "absorbing" || c_.boundary_y == "absorbing"),
           cells_(static_cast<std::size_t>(c_.nx * c_.ny)), antenna_(std::move(antenna)),
+          solid_mask_(std::move(solid_mask)),
           executor_(c_.requested_threads) {
         initialize(initial);
+        if (!solid_mask_.empty()) {
+            solid_density_ = initial.rho;
+            solid_thermal_energy_.resize(cells_.size());
+            for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+                solid_thermal_energy_[cell] = initial.p[cell] / (c_.gamma - 1.0);
+            }
+        }
+        if (absorbing_) {
+            absorption_profile_.resize(cells_.size(), 0.0);
+            for (int j = 0; j < c_.ny; ++j) {
+                for (int i = 0; i < c_.nx; ++i) {
+                    double ramp = 0.0;
+                    if (c_.boundary_x == "absorbing") {
+                        const double distance = std::min((i + 0.5) * dx_, c_.lx - (i + 0.5) * dx_);
+                        ramp = std::max(ramp, 1.0 - distance / c_.absorption_width);
+                    }
+                    if (c_.boundary_y == "absorbing") {
+                        const double distance = std::min((j + 0.5) * dy_, c_.ly - (j + 0.5) * dy_);
+                        ramp = std::max(ramp, 1.0 - distance / c_.absorption_width);
+                    }
+                    const std::size_t cell = index(i, j);
+                    absorption_profile_[cell] = ramp * ramp;
+                    max_absorption_profile_ = std::max(max_absorption_profile_, absorption_profile_[cell]);
+                    if (ramp > 0.0 && is_solid(cell)) {
+                        throw std::runtime_error("The active absorption layer must not overlap a stationary solid");
+                    }
+                }
+            }
+            if (!(max_absorption_profile_ > 0.0)) {
+                throw std::runtime_error("The absorption width must include at least one active cell center");
+            }
+        }
+        if (c_.antenna_model == "prescribed_current") initialize_prescribed_current(initial);
+        else if (c_.antenna_model != "resistive_impressed")
+            throw std::runtime_error("antenna_model must be resistive_impressed or prescribed_current");
     }
 
     void run(const std::string& output_filename) {
-        Hdf5Output output(output_filename, c_, antenna_, executor_.thread_count());
+        Hdf5Output output(output_filename, c_, antenna_, executor_.thread_count(), solid_mask_);
         std::cout << "Running on " << c_.nx << 'x' << c_.ny << " cells with "
                   << executor_.thread_count() << " threads, eta=" << c_.resistivity
                   << ", antenna=" << (antenna_.enabled() ? "on" : "off") << '\n';
@@ -565,9 +809,15 @@ public:
             double dt = stable_timestep(cells_, ch);
             dt = std::min(dt, c_.t_end - time);
             if (next_output > time) dt = std::min(dt, next_output - time);
+            if (current_operator_) {
+                const double tol = 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(time));
+                const auto knot = std::upper_bound(antenna_.time.begin(), antenna_.time.end(), time + tol);
+                if (knot != antenna_.time.end()) dt = std::min(dt, *knot - time);
+            }
             if (!(dt > 0.0) || !std::isfinite(dt)) throw std::runtime_error("Invalid time step");
 
-            advance_ssprk2(dt, ch, time);
+            if (current_operator_) advance_prescribed_current(dt, ch, time);
+            else advance_ssprk2(dt, ch, time);
             time += dt;
             ++step;
             const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
@@ -606,10 +856,49 @@ public:
 private:
     Config c_;
     double dx_, dy_;
+    bool periodic_x_, periodic_y_, absorbing_;
     std::vector<State> cells_;
     AntennaData antenna_;
+    std::vector<double> solid_mask_, solid_density_, solid_thermal_energy_;
+    std::vector<double> absorption_profile_;
+    double max_absorption_profile_ = 0.0;
     ParallelExecutor executor_;
     double antenna_energy_injected_ = 0.0;
+    double solid_constraint_energy_ = 0.0;
+    double boundary_energy_outflow_ = 0.0, boundary_mass_outflow_ = 0.0;
+    double absorption_energy_exchange_ = 0.0, absorption_mass_exchange_ = 0.0;
+    std::array<double, 3> absorption_momentum_exchange_{};
+    std::array<double, 3> solid_force_{}, solid_impulse_{};
+    double max_wall_mass_flux_ = 0.0;
+    std::unique_ptr<PrescribedCurrentOperator> current_operator_;
+    std::vector<double> potential_;
+    const std::vector<double>* active_potential_ = nullptr;
+    double max_stage_current_constraint_error_ = 0.0;
+    double last_circuit_power_ = 0.0;
+    std::vector<double> current_derivative_, potential_rhs_;
+
+    struct RhsRates {
+        double antenna_power = 0.0;
+        double boundary_energy = 0.0, boundary_mass = 0.0;
+        std::array<double, 3> solid_force{};
+        double max_wall_mass_flux = 0.0;
+    };
+
+    bool is_solid(std::size_t cell) const {
+        return !solid_mask_.empty() && solid_mask_[cell] == 1.0;
+    }
+
+    // Freeze only the mechanical/thermal placeholder state.  Magnetic fields
+    // and GLM cleaning remain evolved in the finite-conductivity body.
+    double constrain_solid(State& q, std::size_t cell) const {
+        if (!is_solid(cell)) return 0.0;
+        const double previous_energy = q[total_energy];
+        q[rho] = solid_density_[cell];
+        q[mx] = q[my] = q[mz] = 0.0;
+        q[total_energy] = solid_thermal_energy_[cell] +
+            0.5 * (q[bx] * q[bx] + q[by] * q[by] + q[bz] * q[bz]);
+        return q[total_energy] - previous_energy;
+    }
 
     struct AntennaSlice {
         std::size_t lower = 0;
@@ -624,7 +913,11 @@ private:
     }
 
     std::size_t index(int i, int j) const {
-        return static_cast<std::size_t>(wrapped(j, c_.ny) * c_.nx + wrapped(i, c_.nx));
+        const int column = periodic_x_ ? wrapped(i, c_.nx) :
+            std::clamp(i, 0, c_.nx - 1);
+        const int row = periodic_y_ ? wrapped(j, c_.ny) :
+            std::clamp(j, 0, c_.ny - 1);
+        return static_cast<std::size_t>(row * c_.nx + column);
     }
 
     AntennaSlice antenna_slice(double time) const {
@@ -675,6 +968,20 @@ private:
         return p;
     }
 
+    State ambient_state() const {
+        State q{};
+        q[rho] = c_.ambient[0];
+        for (int component = 0; component < 3; ++component) {
+            q[mx + component] = q[rho] * c_.ambient[2 + component];
+            q[bx + component] = c_.ambient[5 + component];
+        }
+        q[total_energy] = c_.ambient[1] / (c_.gamma - 1.0) +
+            0.5 * q[rho] * (c_.ambient[2] * c_.ambient[2] +
+                            c_.ambient[3] * c_.ambient[3] + c_.ambient[4] * c_.ambient[4]) +
+            0.5 * (q[bx] * q[bx] + q[by] * q[by] + q[bz] * q[bz]);
+        return q;
+    }
+
     void initialize(const InitialData& initial) {
         executor_.for_each(cells_.size(), [&](std::size_t cell) {
             const double density = initial.rho[cell];
@@ -713,9 +1020,13 @@ private:
     State slope(const std::vector<State>& data, int i, int j, int direction) const {
         State result{};
         if (!c_.second_order) return result;
-        const State& center = data[index(i, j)];
-        const State& lower = data[index(i - (direction == 0), j - (direction == 1))];
-        const State& upper = data[index(i + (direction == 0), j + (direction == 1))];
+        if (!solid_mask_.empty() &&
+            (is_solid(index(i, j)) ||
+             is_solid(index(i - (direction == 0), j - (direction == 1))) ||
+             is_solid(index(i + (direction == 0), j + (direction == 1))))) return result;
+        const State center = reconstruction_state(data[index(i, j)]);
+        const State lower = reconstruction_state(data[index(i - (direction == 0), j - (direction == 1))]);
+        const State upper = reconstruction_state(data[index(i + (direction == 0), j + (direction == 1))]);
         for (std::size_t k = 0; k < nvar; ++k) {
             const double backward = center[k] - lower[k];
             const double forward = upper[k] - center[k];
@@ -723,6 +1034,28 @@ private:
                                c_.limiter_theta * forward);
         }
         return result;
+    }
+
+    State reconstruction_state(const State& q) const {
+        if (!current_operator_) return q;
+        const Primitive p = primitive(q);
+        State r = q;
+        r[mx] = p.u; r[my] = p.v; r[mz] = p.w;
+        r[total_energy] = p.pressure;
+        return r;
+    }
+
+    State reconstructed_state(State r, int direction, double normal_b) const {
+        if (!current_operator_) return r;
+        Primitive p{r[rho], r[mx], r[my], r[mz], r[total_energy], r[bx], r[by], r[bz], 0.0};
+        return state_from_primitive(p, direction, normal_b);
+    }
+
+    double ct_normal_field(int i, int j, int direction) const {
+        const auto& a = *active_potential_;
+        const auto ni = [&](int x, int y) { return current_operator_->node_index(x, y); };
+        return direction == 0 ? (a[ni(i + 1, j + 1)] - a[ni(i + 1, j)]) / dy_ :
+                               -(a[ni(i + 1, j + 1)] - a[ni(i, j + 1)]) / dx_;
     }
 
     bool admissible(const State& q) const {
@@ -976,19 +1309,129 @@ private:
         return finish_glm(fr_star);
     }
 
+    State material_face_flux(const State& left, const State& right, bool left_solid,
+                             bool right_solid, int direction, double ch) const {
+        State flux{};
+        const Primitive pl = primitive(left), pr = primitive(right);
+        const double field_left[3] = {pl.bx_value, pl.by_value, pl.bz_value};
+        const double field_right[3] = {pr.bx_value, pr.by_value, pr.bz_value};
+        double field_face[3]{};
+        for (int component = 0; component < 3; ++component) {
+            field_face[component] = 0.5 * (field_left[component] + field_right[component]);
+        }
+
+        if (left_solid != right_solid) {
+            // A reflected fluid ghost determines the gas pressure at a fixed
+            // slip wall.  No fluid mass or advected energy crosses this face.
+            const State& fluid = left_solid ? right : left;
+            const Primitive pf = left_solid ? pr : pl;
+            State mirror = fluid;
+            mirror[mx + direction] = -mirror[mx + direction];
+            const State mechanical = left_solid ? hlld_flux(mirror, fluid, direction, ch) :
+                                                         hlld_flux(fluid, mirror, direction, ch);
+            const double fluid_field[3] = {pf.bx_value, pf.by_value, pf.bz_value};
+            double fluid_magnetic = 0.0, face_magnetic = 0.0;
+            for (int component = 0; component < 3; ++component) {
+                fluid_magnetic += 0.5 * fluid_field[component] * fluid_field[component];
+                face_magnetic += 0.5 * field_face[component] * field_face[component];
+            }
+            const double gas_pressure = std::max(c_.p_floor, mechanical[mx + direction] -
+                fluid_magnetic + fluid_field[direction] * fluid_field[direction]);
+            for (int component = 0; component < 3; ++component) {
+                flux[mx + component] = -field_face[direction] * field_face[component];
+                if (component == direction) flux[mx + component] += gas_pressure + face_magnetic;
+            }
+        }
+
+        // Electromagnetic coupling uses the actual body and fluid fields, not
+        // the reflected fluid ghost.  Body velocity is zero; fluid has zero
+        // normal wall velocity and retains its tangential slip velocity.
+        // The LF term stabilizes the plasma/body interface; body/body faces
+        // have only magnetic diffusion and the GLM subsystem.
+        const double velocity_left[3] = {pl.u, pl.v, pl.w};
+        const double velocity_right[3] = {pr.u, pr.v, pr.w};
+        const double interface_speed = left_solid != right_solid ? ch : 0.0;
+        const double inverse_spacing = 1.0 / (direction == 0 ? dx_ : dy_);
+        for (int component = 0; component < 3; ++component) {
+            if (component != direction) {
+                const double velocity = 0.5 * ((left_solid ? 0.0 : velocity_left[component]) +
+                                               (right_solid ? 0.0 : velocity_right[component]));
+                flux[bx + component] = -field_face[direction] * velocity -
+                    0.5 * interface_speed * (field_right[component] - field_left[component]);
+            }
+            if (!current_operator_) flux[bx + component] -= c_.resistivity * inverse_spacing *
+                (field_right[component] - field_left[component]);
+        }
+        flux[bx + direction] += 0.5 * (pl.psi_value + pr.psi_value) -
+            0.5 * ch * (field_right[direction] - field_left[direction]);
+        flux[psi] = ch * ch * field_face[direction] - 0.5 * ch * (pr.psi_value - pl.psi_value);
+        // Only electromagnetic Poynting energy can enter the rigid body.
+        for (int component = 0; component < 3; ++component) {
+            if (component != direction) flux[total_energy] +=
+                field_face[component] * flux[bx + component];
+        }
+        return flux;
+    }
+
     State face_flux(const std::vector<State>& data, const std::vector<State>& slopes,
                     int i, int j, int direction, double ch) const {
         const std::size_t left_index = index(i, j);
         const std::size_t right_index = index(i + (direction == 0), j + (direction == 1));
-        State left = data[left_index], right = data[right_index];
+        if (is_solid(left_index) || is_solid(right_index)) {
+            State left = data[left_index], right = data[right_index];
+            if (current_operator_) {
+                const double bn = ct_normal_field(i, j, direction);
+                left = state_from_primitive(primitive(left), direction, bn);
+                right = state_from_primitive(primitive(right), direction, bn);
+            }
+            return material_face_flux(left, right,
+                                      is_solid(left_index), is_solid(right_index), direction, ch);
+        }
+        const bool lower_face = direction == 0 ? i < 0 : j < 0;
+        const bool upper_face = direction == 0 ? i == c_.nx - 1 : j == c_.ny - 1;
+        const bool absorbing_axis = direction == 0 ? c_.boundary_x == "absorbing" :
+                                                    c_.boundary_y == "absorbing";
+        if (absorbing_axis && (lower_face || upper_face)) {
+            const State& interior = data[lower_face ? right_index : left_index];
+            const Primitive pi = primitive(interior);
+            const double normal_velocity = direction == 0 ? pi.u : pi.v;
+            const double outward_velocity = (lower_face ? -1.0 : 1.0) * normal_velocity;
+            State exterior = outward_velocity >= fast_speed(pi, direction) ? interior : ambient_state();
+            const Primitive pe = primitive(exterior);
+            // The GLM normal-field pair is extrapolated together.  Resetting
+            // psi alone would launch a cleaning-wave reflection.  Rebuild E
+            // after copying Bn so the exterior thermal pressure is unchanged.
+            exterior[bx + direction] = interior[bx + direction];
+            exterior[psi] = interior[psi];
+            exterior[total_energy] = pe.pressure / (c_.gamma - 1.0) +
+                0.5 * pe.density * (pe.u * pe.u + pe.v * pe.v + pe.w * pe.w) +
+                0.5 * (exterior[bx] * exterior[bx] + exterior[by] * exterior[by] + exterior[bz] * exterior[bz]);
+            // Physical resistivity retains zero normal gradient at this face.
+            if (current_operator_) {
+                const double bn = ct_normal_field(i, j, direction);
+                const State qi = state_from_primitive(pi, direction, bn);
+                exterior = state_from_primitive(primitive(exterior), direction, bn);
+                return lower_face ? hlld_flux(exterior, qi, direction, ch) : hlld_flux(qi, exterior, direction, ch);
+            }
+            return lower_face ? hlld_flux(exterior, interior, direction, ch) :
+                                hlld_flux(interior, exterior, direction, ch);
+        }
+        State left = reconstruction_state(data[left_index]), right = reconstruction_state(data[right_index]);
         for (std::size_t k = 0; k < nvar; ++k) {
             left[k] += 0.5 * slopes[left_index][k];
             right[k] -= 0.5 * slopes[right_index][k];
         }
-        if (!admissible(left)) left = data[left_index];
-        if (!admissible(right)) right = data[right_index];
+        if (current_operator_) {
+            const double bn = ct_normal_field(i, j, direction);
+            left = reconstructed_state(left, direction, bn);
+            right = reconstructed_state(right, direction, bn);
+        }
+        if (!admissible(left)) left = current_operator_ ?
+            state_from_primitive(primitive(data[left_index]), direction, ct_normal_field(i, j, direction)) : data[left_index];
+        if (!admissible(right)) right = current_operator_ ?
+            state_from_primitive(primitive(data[right_index]), direction, ct_normal_field(i, j, direction)) : data[right_index];
         State flux = hlld_flux(left, right, direction, ch);
-        if (c_.resistivity > 0.0) {
+        if (c_.resistivity > 0.0 && !current_operator_) {
             const double inverse_spacing = 1.0 / (direction == 0 ? dx_ : dy_);
             for (int component = 0; component < 3; ++component) {
                 flux[bx + component] -= c_.resistivity * inverse_spacing *
@@ -1011,6 +1454,7 @@ private:
     State antenna_source(const std::vector<State>& data, int i, int j,
                          const AntennaSlice& slice) const {
         State source{};
+        if (current_operator_) return source;
         if (!slice.active) return source;
         const std::size_t cell = index(i, j);
         const Primitive p = primitive(data[cell]);
@@ -1028,6 +1472,11 @@ private:
         source[my] = force[1];
         source[mz] = force[2];
         source[total_energy] = p.u * force[0] + p.v * force[1] + p.w * force[2];
+        if (is_solid(cell)) {
+            // Structural support carries body forces.  It is not a plasma
+            // momentum source; electrical antenna work is still accounted.
+            source[mx] = source[my] = source[mz] = 0.0;
+        }
 
         if (c_.resistivity > 0.0) {
             const auto current_x_plus = antenna_current(slice, index(i + 1, j));
@@ -1060,7 +1509,8 @@ private:
     }
 
     std::vector<State> right_hand_side(const std::vector<State>& data, double ch,
-                                       double time, double& antenna_power) {
+                                       double time, RhsRates& rates) {
+        rates = RhsRates{};
         std::vector<State> sx(data.size()), sy(data.size());
         executor_.for_each(data.size(), [&](std::size_t cell) {
             const int i = static_cast<int>(cell % static_cast<std::size_t>(c_.nx));
@@ -1077,6 +1527,61 @@ private:
             flux_y[cell] = face_flux(data, sy, i, j, 1, ch);
         });
 
+        // Interior arrays store each cell's right/top face.  The left/bottom
+        // nonperiodic faces are distinct faces, not the first interior face.
+        // Outflow uses zero-gradient states; absorbing uses ambient HLLD.
+        std::vector<State> left_boundary_flux, lower_boundary_flux;
+        if (!periodic_x_) {
+            left_boundary_flux.resize(static_cast<std::size_t>(c_.ny));
+            executor_.for_each(left_boundary_flux.size(), [&](std::size_t row) {
+                left_boundary_flux[row] = face_flux(data, sx, -1, static_cast<int>(row), 0, ch);
+            });
+        }
+        if (!periodic_y_) {
+            lower_boundary_flux.resize(static_cast<std::size_t>(c_.nx));
+            executor_.for_each(lower_boundary_flux.size(), [&](std::size_t column) {
+                lower_boundary_flux[column] = face_flux(data, sy, static_cast<int>(column), -1, 1, ch);
+            });
+        }
+
+        if (current_operator_) prescribed_induction_fluxes(data, time, flux_x, flux_y,
+            left_boundary_flux, lower_boundary_flux, rates);
+
+        if (!periodic_x_) {
+            for (int j = 0; j < c_.ny; ++j) {
+                const State& outward = flux_x[index(c_.nx - 1, j)];
+                const State& inward = left_boundary_flux[static_cast<std::size_t>(j)];
+                rates.boundary_energy += (outward[total_energy] - inward[total_energy]) * dy_;
+                rates.boundary_mass += (outward[rho] - inward[rho]) * dy_;
+            }
+        }
+        if (!periodic_y_) {
+            for (int i = 0; i < c_.nx; ++i) {
+                const State& outward = flux_y[index(i, c_.ny - 1)];
+                const State& inward = lower_boundary_flux[static_cast<std::size_t>(i)];
+                rates.boundary_energy += (outward[total_energy] - inward[total_energy]) * dx_;
+                rates.boundary_mass += (outward[rho] - inward[rho]) * dx_;
+            }
+        }
+        if (!solid_mask_.empty()) {
+            for (int j = 0; j < c_.ny; ++j) {
+                for (int i = 0; i < c_.nx; ++i) {
+                    const std::size_t cell = index(i, j);
+                    for (int direction = 0; direction < 2; ++direction) {
+                        const std::size_t next = index(i + (direction == 0), j + (direction == 1));
+                        if (is_solid(cell) == is_solid(next)) continue;
+                        const State& flux = direction == 0 ? flux_x[cell] : flux_y[cell];
+                        const double area = direction == 0 ? dy_ : dx_;
+                        const double sign = is_solid(cell) ? -1.0 : 1.0;
+                        for (int component = 0; component < 3; ++component) {
+                            rates.solid_force[component] += sign * area * flux[mx + component];
+                        }
+                        rates.max_wall_mass_flux = std::max(rates.max_wall_mass_flux, std::abs(flux[rho]));
+                    }
+                }
+            }
+        }
+
         const AntennaSlice antenna = antenna_slice(time);
         std::vector<State> rhs(data.size());
         std::vector<double> antenna_power_density(
@@ -1084,8 +1589,10 @@ private:
         executor_.for_each(data.size(), [&](std::size_t cell) {
             const int i = static_cast<int>(cell % static_cast<std::size_t>(c_.nx));
             const int j = static_cast<int>(cell / static_cast<std::size_t>(c_.nx));
-            const State& left_flux = flux_x[index(i - 1, j)];
-            const State& lower_flux = flux_y[index(i, j - 1)];
+            const State& left_flux = i == 0 && !periodic_x_ ?
+                left_boundary_flux[static_cast<std::size_t>(j)] : flux_x[index(i - 1, j)];
+            const State& lower_flux = j == 0 && !periodic_y_ ?
+                lower_boundary_flux[static_cast<std::size_t>(i)] : flux_y[index(i, j - 1)];
             for (std::size_t k = 0; k < nvar; ++k) {
                 rhs[cell][k] = -(flux_x[cell][k] - left_flux[k]) / dx_ -
                                 (flux_y[cell][k] - lower_flux[k]) / dy_;
@@ -1096,9 +1603,10 @@ private:
                 antenna_power_density[cell] = source[total_energy];
             }
         });
-        antenna_power = 0.0;
-        for (const double power_density : antenna_power_density) antenna_power += power_density;
-        antenna_power *= dx_ * dy_;
+        if (!current_operator_) {
+            for (const double power_density : antenna_power_density) rates.antenna_power += power_density;
+            rates.antenna_power *= dx_ * dy_;
+        }
         return rhs;
     }
 
@@ -1108,8 +1616,28 @@ private:
             const Primitive p = primitive(q);
             maximum = std::max({maximum, std::abs(p.u) + fast_speed(p, 0),
                                 std::abs(p.v) + fast_speed(p, 1)});
+            if (absorbing_) {
+                const Primitive bound = absorption_speed_bound(p);
+                maximum = std::max({maximum, bound.u + fast_speed(bound, 0),
+                                    bound.v + fast_speed(bound, 1)});
+            }
         }
         return c_.glm_speed_factor * std::max(maximum, 1.0e-12);
+    }
+
+    Primitive absorption_speed_bound(Primitive p) const {
+        // Relaxing density before the MHD step can increase the Alfven speed
+        // while B is still present.  Bound the entire fluid relaxation path
+        // and the mixed normal-field ambient face state, not only its ends.
+        p.density = std::min(p.density, c_.ambient[0]);
+        p.pressure = std::max(p.pressure, c_.ambient[1]);
+        p.u = std::max(std::abs(p.u), std::abs(c_.ambient[2]));
+        p.v = std::max(std::abs(p.v), std::abs(c_.ambient[3]));
+        p.w = std::max(std::abs(p.w), std::abs(c_.ambient[4]));
+        p.bx_value = std::max(std::abs(p.bx_value), std::abs(c_.ambient[5]));
+        p.by_value = std::max(std::abs(p.by_value), std::abs(c_.ambient[6]));
+        p.bz_value = std::max(std::abs(p.bz_value), std::abs(c_.ambient[7]));
+        return p;
     }
 
     double stable_timestep(const std::vector<State>& data, double ch) const {
@@ -1118,6 +1646,11 @@ private:
             const Primitive p = primitive(q);
             speed_x = std::max(speed_x, std::abs(p.u) + fast_speed(p, 0));
             speed_y = std::max(speed_y, std::abs(p.v) + fast_speed(p, 1));
+            if (absorbing_) {
+                const Primitive bound = absorption_speed_bound(p);
+                speed_x = std::max(speed_x, bound.u + fast_speed(bound, 0));
+                speed_y = std::max(speed_y, bound.v + fast_speed(bound, 1));
+            }
         }
         double dt = c_.cfl / (speed_x / dx_ + speed_y / dy_);
         if (c_.resistivity > 0.0) {
@@ -1125,25 +1658,338 @@ private:
                 (c_.resistivity * (1.0 / (dx_ * dx_) + 1.0 / (dy_ * dy_)));
             dt = std::min(dt, diffusion_dt);
         }
+        if (absorbing_ && c_.absorption_magnetic_diffusivity > 0.0 && max_absorption_profile_ > 0.0) {
+            const double magnetic_dt = c_.diffusion_cfl /
+                (c_.absorption_magnetic_diffusivity * max_absorption_profile_ *
+                 (1.0 / (dx_ * dx_) + 1.0 / (dy_ * dy_)));
+            dt = std::min(dt, magnetic_dt);
+        }
         return dt;
     }
 
-    void advance_ssprk2(double dt, double ch, double time) {
-        double antenna_power0 = 0.0;
-        const std::vector<State> rhs0 = right_hand_side(cells_, ch, time, antenna_power0);
+    std::vector<State> magnetic_absorption_rhs(const std::vector<State>& data) {
+        std::vector<State> electric(data.size());
+        executor_.for_each(data.size(), [&](std::size_t cell) {
+            const int i = static_cast<int>(cell % static_cast<std::size_t>(c_.nx));
+            const int j = static_cast<int>(cell / static_cast<std::size_t>(c_.nx));
+            const double eta = c_.absorption_magnetic_diffusivity * absorption_profile_[cell];
+            electric[cell][bx] = eta * data_derivative(data, i, j, bz, 1);
+            electric[cell][by] = -eta * data_derivative(data, i, j, bz, 0);
+            electric[cell][bz] = eta * (data_derivative(data, i, j, by, 0) -
+                                       data_derivative(data, i, j, bx, 1));
+            // A clamped central derivative has endpoint terms.  Zeroing
+            // tangential artificial E at every nonperiodic exterior makes
+            // -curl(eta curl B) dissipative in the cell-volume inner product.
+            // Project E before curl, so central div(curl E) still vanishes.
+            if (!periodic_x_ && (i == 0 || i == c_.nx - 1)) {
+                electric[cell][by] = electric[cell][bz] = 0.0;
+            }
+            if (!periodic_y_ && (j == 0 || j == c_.ny - 1)) {
+                electric[cell][bx] = electric[cell][bz] = 0.0;
+            }
+        });
+        std::vector<State> rhs(data.size());
+        executor_.for_each(data.size(), [&](std::size_t cell) {
+            const int i = static_cast<int>(cell % static_cast<std::size_t>(c_.nx));
+            const int j = static_cast<int>(cell / static_cast<std::size_t>(c_.nx));
+            rhs[cell][bx] = -data_derivative(electric, i, j, bz, 1);
+            rhs[cell][by] = data_derivative(electric, i, j, bz, 0);
+            rhs[cell][bz] = -data_derivative(electric, i, j, by, 0) +
+                             data_derivative(electric, i, j, bx, 1);
+        });
+        return rhs;
+    }
+
+    void apply_absorption(double duration) {
+        if (!absorbing_) return;
+        std::vector<double> energy_change(cells_.size(), 0.0), mass_change(cells_.size(), 0.0);
+        std::vector<std::array<double, 3>> momentum_change(cells_.size());
+        executor_.for_each(cells_.size(), [&](std::size_t cell) {
+            if (is_solid(cell) || absorption_profile_[cell] == 0.0) return;
+            State& q = cells_[cell];
+            const Primitive p = primitive(q);
+            const double previous_energy = q[total_energy], previous_mass = q[rho];
+            const double relaxed = -std::expm1(-c_.absorption_rate * absorption_profile_[cell] * duration);
+            const double retained = 1.0 - relaxed;
+            q[rho] = retained * q[rho] + relaxed * c_.ambient[0];
+            for (int component = 0; component < 3; ++component) {
+                const double previous_momentum = q[mx + component];
+                q[mx + component] = retained * q[mx + component] +
+                    relaxed * c_.ambient[0] * c_.ambient[2 + component];
+                momentum_change[cell][component] = q[mx + component] - previous_momentum;
+            }
+            const double thermal = (retained * p.pressure + relaxed * c_.ambient[1]) /
+                                   (c_.gamma - 1.0);
+            q[total_energy] = thermal +
+                0.5 * (q[mx] * q[mx] + q[my] * q[my] + q[mz] * q[mz]) / q[rho] +
+                0.5 * (q[bx] * q[bx] + q[by] * q[by] + q[bz] * q[bz]);
+            energy_change[cell] = q[total_energy] - previous_energy;
+            mass_change[cell] = q[rho] - previous_mass;
+        });
+        if (current_operator_ && c_.absorption_magnetic_diffusivity > 0.0 && max_absorption_profile_ > 0.0)
+            apply_prescribed_magnetic_absorption(duration, energy_change);
+        if (!current_operator_ && c_.absorption_magnetic_diffusivity > 0.0 && max_absorption_profile_ > 0.0) {
+            const std::vector<State> rhs0 = magnetic_absorption_rhs(cells_);
+            std::vector<State> stage = cells_;
+            executor_.for_each(cells_.size(), [&](std::size_t cell) {
+                for (int component = 0; component < 3; ++component) {
+                    stage[cell][bx + component] += duration * rhs0[cell][bx + component];
+                }
+            });
+            const std::vector<State> rhs1 = magnetic_absorption_rhs(stage);
+            executor_.for_each(cells_.size(), [&](std::size_t cell) {
+                State& q = cells_[cell];
+                const double previous_energy = q[total_energy];
+                double magnetic_change = 0.0;
+                for (int component = 0; component < 3; ++component) {
+                    const double old_field = q[bx + component];
+                    q[bx + component] = 0.5 * (old_field + stage[cell][bx + component] +
+                                              duration * rhs1[cell][bx + component]);
+                    magnetic_change += 0.5 * (q[bx + component] * q[bx + component] - old_field * old_field);
+                }
+                // This artificial magnetic sink is not physical resistivity:
+                // remove its magnetic energy into the absorber reservoir and
+                // preserve local thermal pressure instead of adding heat.
+                q[total_energy] += magnetic_change;
+                energy_change[cell] += q[total_energy] - previous_energy;
+            });
+        }
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+            absorption_energy_exchange_ += energy_change[cell] * dx_ * dy_;
+            absorption_mass_exchange_ += mass_change[cell] * dx_ * dy_;
+            for (int component = 0; component < 3; ++component) {
+                absorption_momentum_exchange_[component] += momentum_change[cell][component] * dx_ * dy_;
+            }
+            if (!admissible(cells_[cell])) {
+                throw std::runtime_error("State became non-physical in absorption layer");
+            }
+        }
+    }
+
+    std::vector<double> commanded_current(double time) const {
+        const auto slice = antenna_slice(time);
+        std::vector<double> cell_current(cells_.size());
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell)
+            cell_current[cell] = antenna_current(slice, cell)[2];
+        return current_operator_->project_current(cell_current);
+    }
+
+    void apply_prescribed_magnetic_absorption(double duration, std::vector<double>& energy_change) {
+        const std::vector<double> zero(current_operator_->node_count(), 0.0);
+        const auto rhs = [&](const std::vector<double>& a) {
+            const auto jz = current_operator_->current(a);
+            std::vector<double> adot(a.size(), 0.0);
+            for (int j = 1; j < c_.ny; ++j) for (int i = 1; i < c_.nx; ++i) {
+                const auto n = current_operator_->node_index(i, j);
+                const double profile = 0.25 * (absorption_profile_[index(i-1,j-1)] +
+                    absorption_profile_[index(i,j-1)] + absorption_profile_[index(i-1,j)] +
+                    absorption_profile_[index(i,j)]);
+                adot[n] = -c_.absorption_magnetic_diffusivity * profile * jz[n];
+            }
+            current_operator_->enforce(adot, zero);
+            return adot;
+        };
+        const auto r0 = rhs(potential_);
+        auto stage = potential_;
+        for (std::size_t n = 0; n < stage.size(); ++n) stage[n] += duration * r0[n];
+        const auto r1 = rhs(stage);
+        for (std::size_t n = 0; n < stage.size(); ++n)
+            potential_[n] = 0.5 * (potential_[n] + stage[n] + duration * r1[n]);
+        std::vector<double> old_energy(cells_.size());
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell) old_energy[cell] = cells_[cell][total_energy];
+        synchronize_current_field(cells_, potential_, true);
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell)
+            energy_change[cell] += cells_[cell][total_energy] - old_energy[cell];
+    }
+
+    void synchronize_current_field(std::vector<State>& data, const std::vector<double>& a,
+                                   bool preserve_pressure) const {
+        std::vector<double> bxc, byc;
+        current_operator_->cell_fields(a, bxc, byc);
+        for (std::size_t cell = 0; cell < data.size(); ++cell) {
+            if (preserve_pressure) data[cell][total_energy] += 0.5 *
+                (bxc[cell] * bxc[cell] + byc[cell] * byc[cell] -
+                 data[cell][bx] * data[cell][bx] - data[cell][by] * data[cell][by]);
+            data[cell][bx] = bxc[cell]; data[cell][by] = byc[cell];
+            data[cell][psi] = 0.0;
+        }
+    }
+
+    void initialize_prescribed_current(const InitialData& initial) {
+        if (periodic_x_ || periodic_y_ || solid_mask_.empty() || !antenna_.enabled())
+            throw std::runtime_error("prescribed_current requires nonperiodic boundaries and powered solid cells");
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+            if (initial.w[cell] != 0.0 || initial.bz[cell] != 0.0 ||
+                std::abs(initial.bx[cell] - initial.bx[0]) > 1e-12 ||
+                std::abs(initial.by[cell] - initial.by[0]) > 1e-12)
+                throw std::runtime_error("prescribed_current currently supports planar flow and uniform initial Bx,By only");
+        }
+        if (c_.ambient[4] != 0.0 || c_.ambient[7] != 0.0)
+            throw std::runtime_error("prescribed_current requires planar ambient w=Bz=0");
+        for (std::size_t n = 0; n < antenna_.jz.size(); ++n) {
+            if (antenna_.jx[n] != 0.0 || antenna_.jy[n] != 0.0 ||
+                (!is_solid(n % cells_.size()) && antenna_.jz[n] != 0.0))
+                throw std::runtime_error("prescribed_current accepts only Jz supported inside solid cells");
+        }
+        if (antenna_.time.front() > 0.0 || antenna_.time.back() < c_.t_end)
+            throw std::runtime_error("prescribed_current table must cover the entire simulation interval");
+        current_operator_ = std::make_unique<PrescribedCurrentOperator>(c_.nx, c_.ny, dx_, dy_, solid_mask_);
+        if (absorbing_ && c_.absorption_magnetic_diffusivity > 0.0) {
+            for (int j = 1; j < c_.ny; ++j) for (int i = 1; i < c_.nx; ++i) {
+                if (!current_operator_->powered_mask()[current_operator_->node_index(i, j)]) continue;
+                for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di)
+                    for (int cj = -1; cj <= 0; ++cj) for (int ci = -1; ci <= 0; ++ci)
+                        if (absorption_profile_[index(i + di + ci, j + dj + cj)] > 0.0)
+                            throw std::runtime_error("Powered body must be separated from the magnetic absorption layer by a free grid layer");
+            }
+        }
+        potential_.resize(current_operator_->node_count());
+        for (int j = 0; j <= c_.ny; ++j) for (int i = 0; i <= c_.nx; ++i)
+            potential_[current_operator_->node_index(i, j)] = initial.bx[0] * j * dy_ - initial.by[0] * i * dx_;
+        current_operator_->enforce(potential_, commanded_current(0.0));
+        // Initial nonzero commanded current is an initial, locally screened field.
+        // During time integration B and total energy use compatible FV fluxes;
+        // pressure-preserving synchronization is used only here and in the sponge.
+        synchronize_current_field(cells_, potential_, true);
+    }
+
+    void prescribed_induction_fluxes(const std::vector<State>& data, double time,
+            std::vector<State>& fx, std::vector<State>& fy,
+            std::vector<State>& left, std::vector<State>& bottom, RhsRates& rates) {
+        const auto ni = [&](int i, int j) { return current_operator_->node_index(i, j); };
+        const auto cell_e = [&](int i, int j) {
+            const auto& q = data[index(i, j)];
+            return (q[my] * q[bx] - q[mx] * q[by]) / q[rho];
+        };
+        const auto ex = [&](int i, int j) { // Ez on x face (i,j+1/2)
+            i = std::clamp(i, 0, c_.nx); j = std::clamp(j, 0, c_.ny - 1);
+            return -(i == 0 ? left[j][by] : fx[index(i - 1, j)][by]);
+        };
+        const auto ey = [&](int i, int j) { // Ez on y face (i+1/2,j)
+            i = std::clamp(i, 0, c_.nx - 1); j = std::clamp(j, 0, c_.ny);
+            return j == 0 ? bottom[i][bx] : fy[index(i, j - 1)][bx];
+        };
+        const auto current = current_operator_->current(*active_potential_);
+        potential_rhs_.resize(current_operator_->node_count());
+        // E0 corner EMF: preserves the one-dimensional Riemann flux and its
+        // numerical dissipation. Physical eta*J is added once on the native grid.
+        for (int j = 0; j <= c_.ny; ++j) for (int i = 0; i <= c_.nx; ++i) {
+            double ez = 0.5 * (ex(i, j - 1) + ex(i, j) + ey(i - 1, j) + ey(i, j)) -
+                0.25 * (cell_e(i - 1, j - 1) + cell_e(i, j - 1) +
+                        cell_e(i - 1, j) + cell_e(i, j));
+            ez += c_.resistivity * current[ni(i, j)];
+            potential_rhs_[ni(i, j)] = -ez;
+        }
+        // Differentiate the SAME Ampere constraint. This supplies the inductive
+        // feed voltage without eta, while every nonpowered node keeps its local
+        // plasma Faraday equation. No vacuum field is overwritten in the plasma.
+        current_operator_->enforce(potential_rhs_, current_derivative_);
+        const auto target = commanded_current(time);
+        rates.antenna_power = 0.0;
+        for (std::size_t n = 0; n < target.size(); ++n)
+            rates.antenna_power += target[n] * potential_rhs_[n] * dx_ * dy_;
+        max_stage_current_constraint_error_ = std::max(max_stage_current_constraint_error_,
+            current_operator_->max_residual(*active_potential_, target));
+        const auto correct = [&](State& flux, int i, int j, int direction) {
+            const std::size_t lc = index(i, j), rc = index(i + (direction == 0), j + (direction == 1));
+            const Variable tangent = direction == 0 ? by : bx;
+            const double bt = 0.5 * (data[lc][tangent] + data[rc][tangent]);
+            const double new_flux = direction == 0 ?
+                0.5 * (potential_rhs_[ni(i + 1, j)] + potential_rhs_[ni(i + 1, j + 1)]) :
+               -0.5 * (potential_rhs_[ni(i, j + 1)] + potential_rhs_[ni(i + 1, j + 1)]);
+            // Replace the induction and its Poynting flux together. Total E is
+            // otherwise conservative; never add magnetic resync energy as heat.
+            flux[total_energy] += bt * (new_flux - flux[tangent]);
+            flux[tangent] = new_flux;
+            flux[bx + direction] = 0.0;
+            flux[bz] = flux[psi] = 0.0;
+        };
+        for (int j = 0; j < c_.ny; ++j) for (int i = 0; i < c_.nx; ++i) {
+            correct(fx[index(i, j)], i, j, 0);
+            correct(fy[index(i, j)], i, j, 1);
+        }
+        for (int j = 0; j < c_.ny; ++j) correct(left[j], -1, j, 0);
+        for (int i = 0; i < c_.nx; ++i) correct(bottom[i], i, -1, 1);
+    }
+
+    std::vector<State> prescribed_rhs(const std::vector<State>& data, const std::vector<double>& a,
+            const std::vector<double>& jdot, double ch, double time, RhsRates& rates,
+            std::vector<double>& adot) {
+        active_potential_ = &a;
+        current_derivative_ = jdot;
+        auto rhs = right_hand_side(data, ch, time, rates);
+        adot = potential_rhs_;
+        active_potential_ = nullptr;
+        return rhs;
+    }
+
+    void advance_prescribed_current(double dt, double ch, double time) {
+        apply_absorption(0.5 * dt);
+        const auto j0 = commanded_current(time), j1 = commanded_current(time + dt);
+        std::vector<double> jdot(j0.size()), adot0, adot1;
+        for (std::size_t n = 0; n < jdot.size(); ++n) jdot[n] = (j1[n] - j0[n]) / dt;
+        RhsRates rates0, rates1;
+        const auto rhs0 = prescribed_rhs(cells_, potential_, jdot, ch, time, rates0, adot0);
+        auto stage_a = potential_;
+        for (std::size_t n = 0; n < stage_a.size(); ++n) stage_a[n] += dt * adot0[n];
         std::vector<State> stage(cells_.size());
+        std::vector<double> stage_constraint(cells_.size()), final_constraint(cells_.size());
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+            for (std::size_t k = 0; k < nvar; ++k) stage[cell][k] = cells_[cell][k] + dt * rhs0[cell][k];
+            stage_constraint[cell] = constrain_solid(stage[cell], cell);
+            if (!admissible(stage[cell])) throw std::runtime_error("Nonphysical prescribed-current RK stage; lower cfl");
+        }
+        const auto rhs1 = prescribed_rhs(stage, stage_a, jdot, ch, time + dt, rates1, adot1);
+        for (std::size_t n = 0; n < potential_.size(); ++n)
+            potential_[n] = 0.5 * (potential_[n] + stage_a[n] + dt * adot1[n]);
+        // Remove roundoff drift in the elliptic constraint. This changes only
+        // powered nodes at roundoff level, not the exterior plasma solution.
+        current_operator_->enforce(potential_, j1);
+        for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+            for (std::size_t k = 0; k < nvar; ++k)
+                cells_[cell][k] = 0.5 * (cells_[cell][k] + stage[cell][k] + dt * rhs1[cell][k]);
+            final_constraint[cell] = constrain_solid(cells_[cell], cell);
+            if (!admissible(cells_[cell])) throw std::runtime_error("Nonphysical prescribed-current RK state; lower cfl");
+            solid_constraint_energy_ += (0.5 * stage_constraint[cell] + final_constraint[cell]) * dx_ * dy_;
+        }
+        // Synchronize only floating-point curl drift; no energy is added.
+        synchronize_current_field(cells_, potential_, false);
+        antenna_energy_injected_ += 0.5 * dt * (rates0.antenna_power + rates1.antenna_power);
+        last_circuit_power_ = 0.5 * (rates0.antenna_power + rates1.antenna_power);
+        boundary_energy_outflow_ += 0.5 * dt * (rates0.boundary_energy + rates1.boundary_energy);
+        boundary_mass_outflow_ += 0.5 * dt * (rates0.boundary_mass + rates1.boundary_mass);
+        for (int component = 0; component < 3; ++component) {
+            solid_force_[component] = 0.5 * (rates0.solid_force[component] + rates1.solid_force[component]);
+            solid_impulse_[component] += dt * solid_force_[component];
+        }
+        max_wall_mass_flux_ = std::max({max_wall_mass_flux_, rates0.max_wall_mass_flux, rates1.max_wall_mass_flux});
+        apply_absorption(0.5 * dt);
+    }
+
+    void advance_ssprk2(double dt, double ch, double time) {
+        apply_absorption(0.5 * dt);
+        RhsRates rates0;
+        const std::vector<State> rhs0 = right_hand_side(cells_, ch, time, rates0);
+        std::vector<State> stage(cells_.size());
+        std::vector<double> stage_constraint, final_constraint;
+        if (!solid_mask_.empty()) {
+            stage_constraint.resize(cells_.size(), 0.0);
+            final_constraint.resize(cells_.size(), 0.0);
+        }
         executor_.for_each(cells_.size(), [&](std::size_t cell) {
             for (std::size_t k = 0; k < nvar; ++k) stage[cell][k] = cells_[cell][k] + dt * rhs0[cell][k];
+            if (!solid_mask_.empty()) stage_constraint[cell] = constrain_solid(stage[cell], cell);
             if (!admissible(stage[cell])) {
                 throw std::runtime_error("State became non-physical in Runge-Kutta stage; lower cfl");
             }
         });
-        double antenna_power1 = 0.0;
-        const std::vector<State> rhs1 = right_hand_side(stage, ch, time + dt, antenna_power1);
+        RhsRates rates1;
+        const std::vector<State> rhs1 = right_hand_side(stage, ch, time + dt, rates1);
         executor_.for_each(cells_.size(), [&](std::size_t cell) {
             for (std::size_t k = 0; k < nvar; ++k) {
                 cells_[cell][k] = 0.5 * (cells_[cell][k] + stage[cell][k] + dt * rhs1[cell][k]);
             }
+            if (!solid_mask_.empty()) final_constraint[cell] = constrain_solid(cells_[cell], cell);
             if (!admissible(cells_[cell])) {
                 throw std::runtime_error("State became non-physical after Runge-Kutta step; lower cfl");
             }
@@ -1152,7 +1998,20 @@ private:
             const double decay = std::exp(-c_.glm_damping * ch * dt / std::min(dx_, dy_));
             executor_.for_each(cells_.size(), [&](std::size_t cell) { cells_[cell][psi] *= decay; });
         }
-        antenna_energy_injected_ += 0.5 * dt * (antenna_power0 + antenna_power1);
+        antenna_energy_injected_ += 0.5 * dt * (rates0.antenna_power + rates1.antenna_power);
+        boundary_energy_outflow_ += 0.5 * dt * (rates0.boundary_energy + rates1.boundary_energy);
+        boundary_mass_outflow_ += 0.5 * dt * (rates0.boundary_mass + rates1.boundary_mass);
+        if (!solid_mask_.empty()) {
+            for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+                solid_constraint_energy_ += (0.5 * stage_constraint[cell] + final_constraint[cell]) * dx_ * dy_;
+            }
+            for (int component = 0; component < 3; ++component) {
+                solid_force_[component] = 0.5 * (rates0.solid_force[component] + rates1.solid_force[component]);
+                solid_impulse_[component] += dt * solid_force_[component];
+            }
+            max_wall_mass_flux_ = std::max({max_wall_mass_flux_, rates0.max_wall_mass_flux, rates1.max_wall_mass_flux});
+        }
+        apply_absorption(0.5 * dt);
     }
 
     double derivative(int i, int j, Variable variable, int direction) const {
@@ -1179,6 +2038,18 @@ private:
         auto& out_jaz = fields.at("Jz_antenna");
         auto& out_psi = fields.at("psi");
         const AntennaSlice antenna = antenna_slice(time);
+        std::vector<double> ct_divergence;
+        if (current_operator_) {
+            std::vector<double> bxf, byf;
+            current_operator_->face_fields(potential_, bxf, byf);
+            ct_divergence.resize(cells_.size());
+            for (int j = 0; j < c_.ny; ++j) for (int i = 0; i < c_.nx; ++i)
+                ct_divergence[index(i, j)] =
+                    (bxf[static_cast<std::size_t>(j * (c_.nx + 1) + i + 1)] -
+                     bxf[static_cast<std::size_t>(j * (c_.nx + 1) + i)]) / dx_ +
+                    (byf[static_cast<std::size_t>((j + 1) * c_.nx + i)] -
+                     byf[static_cast<std::size_t>(j * c_.nx + i)]) / dy_;
+        }
         executor_.for_each(cells_.size(), [&](std::size_t cell) {
             const int i = static_cast<int>(cell % static_cast<std::size_t>(c_.nx));
             const int j = static_cast<int>(cell / static_cast<std::size_t>(c_.nx));
@@ -1193,7 +2064,8 @@ private:
             const std::array<double, 3> antenna_value = antenna_current(antenna, cell);
             out_jax[cell] = antenna_value[0]; out_jay[cell] = antenna_value[1];
             out_jaz[cell] = antenna_value[2];
-            out_divb[cell] = derivative(i, j, bx, 0) + derivative(i, j, by, 1);
+            out_divb[cell] = current_operator_ ? ct_divergence[cell] :
+                derivative(i, j, bx, 0) + derivative(i, j, by, 1);
         });
 
         double mass = 0.0, momentum_x = 0.0, momentum_y = 0.0, momentum_z = 0.0;
@@ -1203,6 +2075,8 @@ private:
         double antenna_power = 0.0, max_antenna_current = 0.0;
         double min_density = std::numeric_limits<double>::max();
         double min_pressure = std::numeric_limits<double>::max();
+        double plasma_mass = 0.0, plasma_energy = 0.0, plasma_magnetic = 0.0;
+        double plasma_kinetic = 0.0, plasma_thermal = 0.0, solid_magnetic = 0.0;
         for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
             const Primitive p = primitive(cells_[cell]);
             mass += p.density; momentum_x += cells_[cell][mx]; momentum_y += cells_[cell][my];
@@ -1225,10 +2099,21 @@ private:
             antenna_power += antenna_source(cells_, i, j, antenna)[total_energy];
             min_density = std::min(min_density, p.density);
             min_pressure = std::min(min_pressure, p.pressure);
+            const double magnetic_density = 0.5 *
+                (p.bx_value * p.bx_value + p.by_value * p.by_value + p.bz_value * p.bz_value);
+            if (is_solid(cell)) {
+                solid_magnetic += magnetic_density;
+            } else {
+                plasma_mass += p.density;
+                plasma_energy += cells_[cell][total_energy];
+                plasma_magnetic += magnetic_density;
+                plasma_kinetic += 0.5 * p.density * (p.u * p.u + p.v * p.v + p.w * p.w);
+                plasma_thermal += p.pressure / (c_.gamma - 1.0);
+            }
         }
         const double area = dx_ * dy_;
         const double cell_count = static_cast<double>(cells_.size());
-        const std::map<std::string, double> diagnostics = {
+        std::map<std::string, double> diagnostics = {
             {"step", static_cast<double>(step)}, {"dt", dt}, {"mass", mass * area},
             {"momentum_x", momentum_x * area}, {"momentum_y", momentum_y * area},
             {"momentum_z", momentum_z * area}, {"magnetic_flux_x", flux_x * area},
@@ -1240,9 +2125,41 @@ private:
             {"antenna_energy_injected", antenna_energy_injected_},
             {"max_abs_antenna_current", max_antenna_current}, {"max_speed", max_speed},
             {"max_abs_divB", max_div}, {"l1_divB", l1_div / cell_count},
-            {"max_abs_By", max_by}, {"min_rho", min_density}, {"min_p", min_pressure}
+            {"max_abs_By", max_by}, {"min_rho", min_density}, {"min_p", min_pressure},
+            {"plasma_mass", plasma_mass * area}, {"plasma_energy", plasma_energy * area},
+            {"plasma_magnetic_energy", plasma_magnetic * area},
+            {"plasma_kinetic_energy", plasma_kinetic * area},
+            {"plasma_thermal_energy", plasma_thermal * area},
+            {"solid_magnetic_energy", solid_magnetic * area},
+            {"solid_constraint_energy", solid_constraint_energy_},
+            {"boundary_energy_outflow", boundary_energy_outflow_},
+            {"boundary_mass_outflow", boundary_mass_outflow_},
+            {"solid_force_x", solid_force_[0]}, {"solid_force_y", solid_force_[1]},
+            {"solid_force_z", solid_force_[2]}, {"solid_impulse_x", solid_impulse_[0]},
+            {"solid_impulse_y", solid_impulse_[1]}, {"solid_impulse_z", solid_impulse_[2]},
+            {"max_wall_mass_flux", max_wall_mass_flux_},
+            {"absorption_energy_exchange", absorption_energy_exchange_},
+            {"absorption_mass_exchange", absorption_mass_exchange_},
+            {"absorption_momentum_exchange_x", absorption_momentum_exchange_[0]},
+            {"absorption_momentum_exchange_y", absorption_momentum_exchange_[1]},
+            {"absorption_momentum_exchange_z", absorption_momentum_exchange_[2]}
         };
-        output.append(time, fields, diagnostics);
+        std::map<std::string, std::vector<double>> nodes;
+        if (current_operator_) {
+            const auto target = commanded_current(time);
+            nodes["Az"] = potential_;
+            nodes["Jz"] = current_operator_->current(potential_);
+            nodes["Jz_target"] = target;
+            diagnostics["antenna_power"] = last_circuit_power_;
+            diagnostics["max_current_constraint_error"] = current_operator_->max_residual(potential_, target);
+            diagnostics["max_stage_current_constraint_error"] = max_stage_current_constraint_error_;
+            const double native_energy = current_operator_->magnetic_energy(potential_);
+            diagnostics["native_magnetic_energy"] = native_energy;
+            diagnostics["magnetic_averaging_energy"] = native_energy - magnetic * area;
+            diagnostics["current_drive_energy_correction"] = solid_constraint_energy_ - antenna_energy_injected_;
+            diagnostics["max_abs_ct_divB"] = max_div;
+        }
+        output.append(time, fields, diagnostics, nodes);
     }
 };
 
@@ -1256,7 +2173,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         SolverInput input = read_solver_input(argv[1]);
-        Solver solver(std::move(input.config), std::move(input.initial), std::move(input.antenna));
+        Solver solver(std::move(input.config), std::move(input.initial), std::move(input.antenna),
+                      std::move(input.solid_mask));
         solver.run(argv[2]);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
