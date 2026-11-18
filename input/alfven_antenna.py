@@ -52,15 +52,14 @@ def centered_current_ribbon(x, y):
     periodic_distance = np.minimum(distance, grid["lx"] - distance)
     distance = np.abs(y - 0.5 * grid["ly"])
     periodic_distance_y = np.minimum(distance, grid["ly"] - distance)
-    return antenna_amplitude * np.exp(-0.5 * (periodic_distance / antenna_width) ** 2) #\
-       # * np.exp(-0.5 * (periodic_distance_y / antenna_width) ** 2)
+    return antenna_amplitude * np.exp(-0.5 * (periodic_distance / antenna_width) ** 2) * np.exp(-0.5 * (periodic_distance_y / antenna_width) ** 2)
 
 
 def smooth_pulse(t):
     """A compact sin^2 pulse with zero value and slope at both endpoints."""
     inside = (t >= 0.0) & (t <= antenna_duration)
     return np.where(inside, np.sin(5 * 2 * np.pi * t / antenna_duration), 0.0)
-
+ 
 
 # Like SMILEI, each antenna selects one current component and combines spatial
 # and temporal Python profiles.  Multiple antenna dictionaries may be supplied.

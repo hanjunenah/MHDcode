@@ -14,7 +14,7 @@ solver = {
     "gamma": 5.0 / 3.0,
     "cfl": 0.35,
     "diffusion_cfl": 0.45,
-    "resistivity": 5e-3,
+    "resistivity": 5.45e-3,
     "t_end": 100.0,
     "max_steps": 200_000,
     "second_order": True,
