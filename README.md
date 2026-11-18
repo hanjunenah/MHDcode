@@ -5,6 +5,11 @@ resistive magnetohydrodynamics. Fields vary in `x` and `y`, while velocity,
 magnetic field, and current retain three components. Python problem files define
 the grid, initial state, runtime settings, and optional current antennas.
 
+Thruster input files (`input/*thruster*.py`) and all generated `output/`
+files are local-only and excluded from the GitHub repository. The published
+checkout includes the generic example inputs below. Optional local-study
+notes refer to separately retained files and results.
+
 ## Features
 
 - Conservative total-energy ideal-MHD update
@@ -52,7 +57,6 @@ Run one of the supplied problems:
 python3 run.py input/harris.py
 python3 run.py input/alfven_antenna.py
 python3 run.py input/orszag_tang.py
-python3 run.py input/reconnection_thruster.py
 ```
 
 Existing output files are protected. Use `--force` to replace one, and use
@@ -66,43 +70,159 @@ python3 run.py input/harris.py --threads 4 --t-end 1.0 \
 At each save interval, the solver reports wall time for the interval,
 cumulative elapsed time, and estimated time remaining.
 
-All thruster results live under `output/thruster/`. The canonical input is
-`input/reconnection_thruster.py`, writing to
-`output/thruster/prescribed_current/`. It drives the actual current density
+On this workspace's Homebrew installation, `pkg-config hdf5` selects an MPI
+build whose flags omit the MPI include directory. To build with the installed
+serial HDF5 instead, use:
+
+```sh
+PKG_CONFIG_PATH=/opt/homebrew/opt/hdf5@1.14/lib/pkgconfig make
+```
+
+## Optional local thruster studies
+
+This section describes local inputs and outputs that are not distributed
+with the source. Its commands require those separately retained files.
+
+The local fiducial thruster is the standalone
+`input/reconnection_thruster_injection_open.py`.
+It combines the former localized-plasma, injection and open-exterior input
+files into one case. Its defaults are:
+
+- 256 x 128 cells on a 36 x 24 domain, with open-front powered plates.
+- Background-only initial fluid density 0.01 and uniform initial pressure 0.01;
+  no dense initial propellant load. Solid states are fixed placeholders.
+- Continuous plasma feeding near the throat at 0.01 code mass/time
+  (approximately 0.0833 mg/s with the example SI normalization), zero feed
+  velocity and specific internal energy 0.015.
+- Plasma resistivity 0.001, angular frequency 0.05, peak current scale about
+  0.751282, ten drive cycles and eight worker threads.
+- Extrapolated exterior face states with a two-unit weak sponge: fluid
+  relaxation 0.02 and extra magnetic diffusivity 0.001.
+
+The inlet profile is normalized on the mesh to keep the specified total
+feed rate independent of spatial sampling. The finite background keeps the
+single-fluid MHD equations well-defined; it is not vacuum. Uniform initial
+pressure avoids an initial gas-pressure launch, so the tenuous background is
+hotter than the fed plasma. Results are written under
+`output/thruster/injection/open/`.
+
+`MHD_THRUSTER_MASS_FLOW_CODE` sets the feeding rate. Set
+`MHD_THRUSTER_ABSORPTION_RATE`, `MHD_THRUSTER_BUFFER_ETA`,
+`MHD_THRUSTER_BOUNDARY_EXTERIOR`, or `MHD_THRUSTER_BUFFER` to tune the boundary
+layer. This is an extrapolated-face/weak-sponge approximation, not an exact
+nonreflecting or vacuum boundary.
+
+Eight workers had the best repeated 256 x 128 benchmark median: 4.06 s,
+versus 4.12 s with ten and 4.29 s with fourteen workers for the same 508 steps.
+Eight and ten are effectively tied; eight uses fewer workers. The benchmark
+script and summary are under
+`output/thruster/injection/validation/thread_benchmark/`.
+`MHD_THRUSTER_THREADS` and `--threads` override the choice.
+
+For a closed-front comparison with the fed fiducial case, use:
+
+```sh
+python3 run.py input/reconnection_thruster_closed_front.py
+```
+
+This standalone input matches the open-front fiducial's 256 x 128 grid,
+36 x 24 domain, background-only initial plasma, continuous feed, drive,
+duration, weak outflow buffer, SI scaling and eight workers. A
+constant-thickness circular nose
+joins the two plate centerlines tangentially and closes the front opening.
+The current profile continues around the nose, with the same peak current
+density and only downstream tip tapering. The downstream arms are unchanged.
+This is a powered U-shaped antenna: at the default 256 x 128 sampling its
+integrated current is about 14% larger, so this compares antenna shapes at
+fixed peak current density, not fixed total current. Thermal annotations are
+recomputed for the new geometry without renormalizing the drive. New results
+are written separately under
+`output/thruster/injection/closed_front/`. This fed closed-front case has
+completed ten cycles in 875.7 s (14 min 35.7 s), taking 102,430 steps and
+saving 321 frames through `t=1256.6370614`.
+
+The local uniform-initial-plasma reference is
+`input/reconnection_thruster.py`. It uses a stronger ambient/sponge boundary
+and defaults to 512 x 256 with ten workers. Historical uniform-plasma
+closed-front results were removed during cleanup; they did not represent
+the new fed comparison.
+
+Earlier localized-initial-load results were also removed. Strong-buffer fed
+comparison data, archived inputs and validation reports remain locally under
+`output/thruster/injection/`. The separate localized and
+injection input files have been consolidated into the fiducial file above.
+
+Retained local thruster results live under `output/thruster/`, which now
+contains only `injection/` and `fiducial/`. The local fiducial input is
+`input/reconnection_thruster_injection_open.py`, writing to
+`output/thruster/injection/open/`. It drives the actual current density
 inside stationary nonplasma plates, using `solver["antenna_model"] =
 "prescribed_current"`. The plates admit magnetic field; their current is
 independent of plasma resistivity. The plasma and absorbing outer boundaries
-evolve self-consistently. The historical fiducial runs remain under
+evolve self-consistently. The historical resistive-impressed fiducial runs remain under
 `output/thruster/fiducial/`. Retired conductor runs, earlier resistive trials,
-and thread-benchmark outputs were removed during cleanup; active-model
-validation and domain comparisons remain under `prescribed_current/`.
+old uniform-plasma outputs and root-level validation/domain/design archives
+were removed during cleanup. Retained fed-case validation and boundary
+comparisons are inside `output/thruster/injection/`.
+
+The current open-front fed fiducial completed ten cycles on 256 x 128 in
+830.8 s (13 min 50.8 s), taking 97,632 steps and saving 321 frames through
+`t=1256.6370614`. Its result is under
+`output/thruster/injection/open/eta_0.001/`. Validation passed: minimum
+saved density and gas pressure are 0.007816 and 0.007475, no saved plasma
+cell reaches either floor, and relative mass/energy budget residuals are
+3.34e-13 and 6.88e-13. The full report is
+[`result_validation.json`](output/thruster/injection/open/validation/production_20261118/result_validation.json).
+
+The fed closed-front run also passed validation. Its saved fields are
+finite, body velocity remains zero, and no saved plasma cell reaches a
+density or pressure floor. Minimum density and gas pressure are 0.005521
+and 0.003233; relative mass/energy residuals are 8.10e-13 and 6.71e-13.
+Its full report is
+[`result_validation.json`](output/thruster/injection/closed_front/validation/production_20261118/result_validation.json).
+
+The final five drive cycles give the following body-thrust and apparent
+feed-based specific-impulse diagnostics with the example SI scaling:
+
+| Fed configuration | Mean useful thrust (mN) | Cycle-thrust standard deviation (mN) | Apparent feed-based Isp (s) |
+| --- | ---: | ---: | ---: |
+| Open-front fiducial | 0.35174 | 0.00358 | 430.56 |
+| Closed front | 0.19810 | 0.01262 | 242.49 |
+
+This comparison holds peak current density fixed; the closed front carries
+14.2% more integrated absolute current. Feeding, drive and boundary settings
+match. The selected peak current is 0.112% above the estimated closed-front
+thermal ceiling; the hardware annotations retain this difference instead of
+renormalizing the comparison. These diagnostics retain the background-plasma, boundary and
+resolution limitations described below. The comparison data and plot are
+[`fed_front_comparison.json`](output/thruster/injection/comparison/fed_front_comparison.json),
+[`fed_front_cycles.csv`](output/thruster/injection/comparison/fed_front_cycles.csv)
+and [`fed_front_thrust_Isp.png`](output/thruster/injection/comparison/fed_front_thrust_Isp.png).
 
 The previous prescribed-current production run at current amplitude 1 and
 omega=0.005 completed three cycles on 256 x 128 at eta=0.001 in 102,336 steps
 (14 min 38 s), with 97 saved frames.
-Its input snapshot, log, manifest, validation and plots are in
-[`output/thruster/prescribed_current/eta_0.001/`](output/thruster/prescribed_current/eta_0.001/).
-Saved density and pressure stay positive, the plate current is enforced to
+Its input snapshot and result artifacts were removed during cleanup.
+Saved density and pressure stayed positive, the plate current was enforced to
 1.9e-14, and startup matches the retained quarter-cycle reference exactly.
 The compact buffer is strongly contacted (peak entrance density perturbation
 38.8%), and cycle-to-cycle fields are still evolving; these results do not
 establish converged thrust or efficiency.
 
-The fiducial default is the padded domain: 36 x 24 at 384 x 256, with two-unit
-absorbing layers. The plate front is at x=9 and the throat center at y=12.
+The fiducial thruster defaults to the padded domain: 36 x 24 at 256 x 128,
+with a two-unit weak sponge. The plate front is at x=9 and the throat center at y=12.
 Plate length, slope, gap, thickness, and current profile retain their physical
 sizes; relative to the compact box, the thruster translates by (+3,+6)
-without rescaling. Cell spacing remains 0.09375,
-compared with 0.15625 in the earlier 40 x 20 box.
+without rescaling. The fed closed-front comparison uses the same grid and
+box as the fiducial case. The uniform-plasma reference defaults to 512 x 256
+on the same domain.
 
 Defaults include plasma resistivity `eta=0.001`, angular frequency
-`omega=0.0004`, and a passive-copper thermal current ceiling (nominal code
-amplitude about 0.751282). Three drive periods now end at `t=47123.890`.
-The longer period needs approximately 12.5 times as many diffusion-limited
-steps as the previous omega=0.005 run; a full default run can take hours.
-The thruster defaults to 10 worker threads, measured fastest
-on this Mac's 10 performance and 4 efficiency cores at both 256 x 128 and
-512 x 256. Set `MHD_THRUSTER_THREADS` or `--threads` to override.
+`omega=0.05`, and a passive-copper thermal current ceiling (nominal code
+amplitude about 0.751282). Ten drive periods end at `t=1256.637061`.
+The fiducial defaults to eight worker threads based on repeated timings.
+The uniform-plasma reference retains ten workers from its earlier benchmark.
+Set `MHD_THRUSTER_THREADS` or `--threads` to override.
 Set `MHD_THRUSTER_ETA`, `MHD_THRUSTER_CURRENT_SCALE`, `MHD_THRUSTER_OMEGA`, `MHD_THRUSTER_CYCLES`,
 or `MHD_THRUSTER_NX`/`MHD_THRUSTER_NY` for physical/grid comparisons.
 `MHD_THRUSTER_LX`, `MHD_THRUSTER_LY`, and `MHD_THRUSTER_BUFFER` override the
@@ -116,34 +236,34 @@ outer plate tips sideways, 7 upstream, and 18.33 downstream. A normal launch
 uses this larger domain:
 
 ```sh
-python3 run.py input/reconnection_thruster.py
+python3 run.py input/reconnection_thruster_injection_open.py
 ```
 
 The compact preview remains available explicitly:
 
 ```sh
-MHD_THRUSTER_DOMAIN=compact python3 run.py input/reconnection_thruster.py
+MHD_THRUSTER_DOMAIN=compact python3 run.py input/reconnection_thruster_injection_open.py
 ```
 
 That uses 256 x 128 on 24 x 12, with clearances of only 2.05 sideways,
 4 upstream, and 9.33 downstream. The previous amplitude-1, omega=0.005
 compact quarter-cycle run already had about 0.65% density perturbation at
-the side-buffer entrance. The padded default has three times as many cells
-while preserving plate resolution, current profile, resistivity, frequency,
-and buffer width. Changing box lengths alone at fixed grid size coarsens
-the plates and mixes boundary and resolution effects. Even the padded domain encounters outgoing
+the side-buffer entrance. With the fiducial's fixed 256 x 128 resolution,
+the compact option changes cell spacing as well as the box size. Change
+resolution with box size to isolate boundary effects from plate resolution.
+Even the padded domain encounters outgoing
 waves within a drive cycle; compare near-thruster fields and cycle impulse
 across domains before interpreting thrust or efficiency quantitatively.
 
-The matched-spacing startup-quarter comparison (256 x 128 compact versus
+The historical matched-spacing startup-quarter comparison (256 x 128 compact versus
 384 x 256 padded) changes useful axial impulse by +2.21% and native circuit
 work by +0.0507%; near-thruster momentum density differs by 3.88% in relative
 L2 norm. A lower-resolution full-cycle comparison changes net impulse
 magnitude by 69%, indicating substantial late boundary sensitivity; those
 coarse plates remain underresolved for quantitative power or efficiency.
-Neither comparison establishes domain-converged cycle thrust. Reproduction
-commands, measurements and the comparison plot are saved under
-[`output/thruster/prescribed_current/domain_comparison/`](output/thruster/prescribed_current/domain_comparison/).
+Neither comparison establishes domain-converged cycle thrust. The original
+domain-comparison files were removed during cleanup; these values summarize
+the historical measurements.
 
 The historical resistive-impressed one-cycle fiducial reference reaches one full period in 34,112 steps and
 3 min 2 s on this Mac. Its preview, frozen input, manifest, and validation
@@ -152,7 +272,7 @@ finite and positive, and mass/energy budgets close within 4.6e-12.
 Late transverse flow reaches the side buffers; this run does not establish
 domain independence. These timings and validation results describe the previous
 drive model, not the prescribed-current update. Set `MHD_THRUSTER_CYCLES=1`
-for a one-cycle run; the canonical input runs three cycles by default.
+for a one-cycle run; the current fiducial runs ten cycles by default.
 
 The historical resistive-impressed three-cycle run reaches `t=3769.911` in 102,336 steps and
 9 min 13 s, with 97 saved frames. Its result has the suffix `_cycles3.h5`;
@@ -167,15 +287,7 @@ At fixed cell count, shrinking the box decreases the diffusion-limited
 timestep and increases the number of steps. Refine the fiducial grid with:
 
 ```sh
-MHD_THRUSTER_NX=768 MHD_THRUSTER_NY=512 python3 run.py input/reconnection_thruster.py
-```
-
-On this workspace's Homebrew installation, `pkg-config hdf5` selects an MPI
-build whose flags omit the MPI include directory. To build with the installed
-serial HDF5 instead, use:
-
-```sh
-PKG_CONFIG_PATH=/opt/homebrew/opt/hdf5@1.14/lib/pkgconfig make
+MHD_THRUSTER_NX=512 MHD_THRUSTER_NY=256 python3 run.py input/reconnection_thruster_injection_open.py
 ```
 
 ## Equations
@@ -271,9 +383,10 @@ removes its magnetic drive.
 
 ### Powered prescribed-current plates
 
-Use `solver["antenna_model"] = "prescribed_current"` to specify actual `Jz`
-inside stationary nonplasma bodies. This planar branch requires nonperiodic
-boundaries, `w=Bz=0`, spatially uniform initial `Bx` and `By`, no `Jx` or `Jy`,
+`prescribed_current` is the default antenna option for the local thruster
+and powered-plate inputs. Set `solver["antenna_model"] = "prescribed_current"`
+to specify actual `Jz` inside stationary nonplasma bodies. This planar branch
+requires nonperiodic boundaries, `w=Bz=0`, spatially uniform initial `Bx` and `By`, no `Jx` or `Jy`,
 and current support confined to `solid_mask`. Other examples continue to use
 the default 2.5-D impressed-current model.
 
@@ -327,14 +440,12 @@ The 96 x 48 plates are underresolved for power or efficiency estimates. This
 check demonstrates spatial convergence of the coupling; it does not replace
 time-dependent resolution and domain checks for thrust. Machine-precision
 closure of the budget including the correction is an accounting identity,
-not evidence that physical circuit power is resolved. Reproducible source,
-measurements, and build/run commands are in
-[`power_coupling_check.cpp`](output/thruster/prescribed_current/validation/power_coupling_check.cpp)
-and [`power_coupling_check.json`](output/thruster/prescribed_current/validation/power_coupling_check.json).
+not evidence that physical circuit power is resolved. The auxiliary source
+and result files for this historical static check were removed during cleanup.
 
 ## SI scaling, passive copper and drive frequency
 
-The thruster input now supplies an explicit illustrative normalization:
+The optional local thruster inputs use an explicit illustrative normalization:
 `L0=0.01 m`, `B0=0.02 T`, singly ionized xenon `n0=1e18 m^-3`, and active
 out-of-plane length `Dz=0.1 m`. Thus `J0=B0/(mu0*L0)=1.59155 A/mm²` and
 `I0=B0*L0/mu0=159.155 A`. These references are assumptions, not SI units
@@ -382,13 +493,13 @@ not automatic feedback or a measured new reconnection rate. The ordinary
 frequency is `f=omega/(2*pi)`, and the signed half-cycle is `pi/omega`.
 [Sweet–Parker derivation](https://farside.ph.utexas.edu/teaching/plasma/Plasma/node101.html).
 
-With the illustrative xenon density, the new drive is about 243 Hz; copper
-skin depth at 80°C is about 4.7 mm. The predicted SP half-thickness is still
+With the illustrative xenon density, the historical `omega=0.0004` drive is
+about 243 Hz; copper skin depth at 80°C is about 4.7 mm. The predicted SP half-thickness is still
 only about 1–2 default cells, so a frequency change does not establish
 resolved reconnection. Also the ion inertial length at this SI density is
 about 2.6 m, exceeding the device size: single-fluid resistive MHD does not
 establish real Hall-size reconnection physics. These SI and thermal estimates
-are documented in `output/thruster/passive_copper_design/`.
+were originally documented in design files that were removed during cleanup.
 
 The launcher preserves optional `physical_scaling` and `antenna_hardware`
 attribute groups in completed HDF5 results; fields remain dimensionless.
@@ -443,6 +554,52 @@ present, the launcher checks their discrete Ampère compatibility.
 FFT initialization from current alone requires both axes to be periodic.
 Supply `magnetic_field(x, y)` when using nonperiodic boundaries.
 
+### Plasma injection
+
+An optional `plasma_injection` dictionary adds plasma in a spatial region:
+
+```python
+plasma_injection = {
+    "mass_rate": lambda x, y: 0.01*np.exp(-((x-2)/0.3)**2-((y-1)/0.2)**2),
+    "u": 0.0, "v": 0.0, "w": 0.0,
+    "specific_internal_energy": 0.015,
+    "time_profile": 1.0,
+}
+```
+
+`mass_rate` is density added per unit time and volume, before multiplication
+by `time_profile`. Spatial values may be scalars or functions of `(x, y)`.
+Feed velocities default to zero; `specific_internal_energy` is required and
+must be positive wherever mass is added. For injected pressure and density,
+use `specific_internal_energy = p_inj / ((gamma-1)*rho_inj)`.
+The solver adds the conservative sources
+
+```text
+S_rho = q
+S_momentum = q * v_inj
+S_energy = q * (specific_internal_energy + |v_inj|^2/2)
+q = mass_rate * time_profile(t)
+```
+
+This is mass addition and mixing, not a density reset. It supplies no magnetic
+field and does not remove existing plasma. A callable `time_profile(t)` also
+requires a positive `sampling_interval` in this dictionary. Values are
+linearly interpolated, with timesteps ending at temporal knots; rates and
+temporal amplitudes must be finite and nonnegative. Injection must be zero
+inside solids. The planar `prescribed_current` model requires injected `w=0`.
+Omit the dictionary, or set it to `None`, to disable injection.
+
+Result files retain the sampled profiles under `/plasma_injection` and add
+cumulative `injection_mass`, `injection_momentum_x/y/z` and `injection_energy`
+diagnostics. Add `injection_mass` to the plasma mass budget and
+`injection_energy` to the global energy budget; both exclude the initial
+load. The antenna viewer includes this feed energy in its plotted balance.
+Nonzero feed velocity supplies external momentum; feed-hardware reaction is
+outside the antenna's `solid_force_*` diagnostic. Very strong feeding can
+change wave speeds within a timestep and requires a smaller CFL and checks
+of temporal resolution. This single-fluid source represents already ionized
+plasma; neutral transport and ionization energy are not modeled.
+
 ### Outer boundaries
 
 Set `solver["boundary_x"]` and `solver["boundary_y"]` to `"periodic"` (the
@@ -462,6 +619,7 @@ solver = {
     "absorption_width": 3.0,                 # physical length from each face
     "absorption_rate": 0.5,                  # maximum fluid relaxation rate
     "absorption_magnetic_diffusivity": 0.05, # additional buffer diffusivity
+    "absorption_exterior": "ambient",        # ambient or outflow
 }
 boundary_ambient = {"rho": 1.0, "p": 0.01}  # u/v/w/Bx/By/Bz default to zero
 ```
@@ -472,9 +630,15 @@ ambient state. Magnetic damping uses `-curl(eta_buffer curl(B))`, preserving the
 solver's centered discrete divergence; it does not directly relax individual
 magnetic components toward the ambient field. Its magnetic energy change goes
 to the artificial absorber reservoir while local thermal pressure is preserved.
-The exterior Riemann state preserves the interior normal magnetic field and GLM
-field and uses ambient tangential fields and fluid variables. Super-fast outward
-flow uses the interior state. The physical `resistivity` in the analysis region
+With `absorption_exterior="ambient"` (the backward-compatible default), the
+exterior Riemann state preserves the interior normal magnetic field and GLM
+field and uses ambient tangential fields and fluid variables. Super-fast
+outward flow uses the interior state. With `absorption_exterior="outflow"`,
+the face state is extrapolated from the interior even for sub-fast flow;
+the volume sponge still operates independently. This permits the weak-sponge
+case to pass the outgoing plume at its outer faces without replacing that
+face state by a stationary reservoir. It also permits backflow, as ordinary
+zero-gradient outflow does. The physical `resistivity` in the analysis region
 is unchanged.
 
 This is a sponge/far-field approximation, not an exact nonreflecting condition
@@ -509,10 +673,27 @@ E(t) - E(0) = antenna_energy_injected + current_drive_energy_correction
 The first two terms together equal `solid_constraint_energy` in this mode;
 do not add native circuit work to that constraint exchange a second time.
 
-`input/reconnection_thruster.py` uses this mode on a 384 x 256 grid,
+The uniform-plasma reference, `input/reconnection_thruster.py`, uses this mode on a 512 x 256 grid,
 with plasma eta=0.001, stationary powered plates, and continuous drive.
 Its 36 x 24 domain has a two-unit buffer on every side, with magnetic
 buffer diffusivity 0.05 in addition to the physical plasma resistivity.
+The fiducial `input/reconnection_thruster_injection_open.py` uses the gentler
+extrapolated faces at 256 x 128. Boundary sensitivity experiments
+and outgoing fast-wave tests are saved under
+`output/thruster/injection/boundary_comparison/`.
+In a controlled ten-cycle 128 x 96 comparison, the last five cycles' net
+sponge mass removal fell from 91.1% to 18.1% of the injected mass, while net
+outer-face outflow rose from 1.97% to 87.5%. These are mixture mass balances
+normalized by feeding, not traced propellant fractions; changing domain
+inventory can make their sum differ from 100%. Mean body thrust changed by
+1.39% on that grid. A separate small-amplitude outgoing fast-wave test against
+an extended-domain reference reduced returned fast-mode amplitude from
+1.26% to 0.378%. This demonstrates improvement for those tests, not general
+nonreflection or resolution-converged thrust. The source/body geometry in
+the coarse comparison is underresolved. These boundary comparisons used
+128 x 96. The ten-cycle 256 x 128 weak-boundary open-front fiducial has now
+completed and passed its numerical checks. This alone does not establish
+boundary or resolution convergence.
 
 ### Fixed current-carrying bodies
 
@@ -620,7 +801,6 @@ resolve the shortest imposed timescale.
 | Double Harris sheet | [`input/harris.py`](input/harris.py) | Periodic resistive reconnection |
 | Current antenna | [`input/alfven_antenna.py`](input/alfven_antenna.py) | Localized driven MHD-wave response |
 | Orszag-Tang vortex | [`input/orszag_tang.py`](input/orszag_tang.py) | Shock interaction and turbulence benchmark |
-| Reconnection thruster | [`input/reconnection_thruster.py`](input/reconnection_thruster.py) | Powered current-density plates, continuous drive, absorbing exterior, plasma eta=0.001 |
 
 ### Orszag-Tang validation
 
@@ -704,8 +884,6 @@ Open the antenna-focused viewer:
 
 ```sh
 python3 plot_antenna_results.py output/alfven_antenna.h5
-python3 plot_antenna_results.py output/thruster/prescribed_current/eta_0.001/thruster_256x128_L24x12_J1_cycles3.h5 \
-    --velocity-component x --frame 88
 ```
 
 Both viewers provide a time slider and arrow-key navigation. Render without a
@@ -722,6 +900,95 @@ direction. Its density-perturbation scale uses the 98th percentile of
 hide weaker disturbances. The scale stays fixed while moving the slider;
 colorbar extensions mark saturated values. Set `--density-limit 0.01` to use
 an explicit symmetric range of -0.01 to +0.01.
+
+For separately retained local thruster data, open the dedicated viewer.
+This example uses the local completed ten-cycle 256 x 128 open-front
+fiducial; its HDF5 file is not included in the GitHub checkout:
+
+```sh
+python3 plot_thruster_results.py output/thruster/injection/open/eta_0.001/thruster_injection_openbc_256x128_L36x24_rho_bg0.01_mdot0.01_J0.75128226_omega0.05_cycles10_rate0.02_etaBuffer0.001_outflow.h5
+```
+
+It defaults to the final frame, axial velocity and momentum, and the whole
+simulation domain. Orange dashed outlines mark the plasma source on the spatial
+panels. The local injection map, source peak, integrated feed rate and
+cumulative added mass follow the time slider. The viewer reads these from
+the result's archived `/plasma_injection` profiles and diagnostics, so later
+input edits do not change the displayed source. It shows the actual axial
+velocity `v_x`, absolute gas pressure `p`, and absolute density on a logarithmic
+scale. The center spatial panel shows the plasma electric field
+`E_z = v_y B_x - v_x B_y + eta J_z` reconstructed from Ohm's law for
+prescribed-current runs, with the plates masked and a signed color range
+fixed across all frames. In the legacy resistive-impressed mode, the
+resistive term uses `J_z - J_z_antenna`.
+
+The bottom-center panel combines thrust on the left axis with apparent
+feed-based specific impulse on the right axis. The specific-impulse curves
+use stored body impulse divided by mass injected over matching output
+intervals (dotted) and cumulatively from the first frame (dashed). Values
+remain in seconds even with `--units code`; SI reference metadata is required
+for this conversion. Zero-feed windows and missing reference scales are
+marked undefined. The slider moves its time marker along with the thrust and
+feed histories. This is a signed quantity, positive for useful thrust toward
+`-x`, and it includes the background-plasma limitations described below.
+
+The thrust panel shows the saved last-step force, output-interval means from
+stored impulse, and completed-cycle means when frequency metadata is present.
+Positive thrust is force on the antenna toward `-x`, opposite the `+x` opening.
+Cycle boundaries between saved frames use interpolated impulse and are labeled
+accordingly. SI time, force and feed units use the saved reference scales,
+including the out-of-plane depth. Use `--units code` to display code units,
+`--zoom` for a close-up of the plates, and `--frame` / `--save` for a static image.
+`--full-domain` remains available and explicitly selects the default full view.
+Runs without feeding display zero source and zero injected mass.
+
+Export every saved frame as an H.264 MP4 with FFmpeg:
+
+```sh
+python3 plot_thruster_results.py output/thruster/injection/open/eta_0.001/thruster_injection_openbc_256x128_L36x24_rho_bg0.01_mdot0.01_J0.75128226_omega0.05_cycles10_rate0.02_etaBuffer0.001_outflow.h5 \
+    --movie output/thruster/injection/open/eta_0.001/thruster_injection_openbc_256x128_L36x24_rho_bg0.01_mdot0.01_J0.75128226_omega0.05_cycles10_rate0.02_etaBuffer0.001_outflow.mp4 --fps 20
+```
+
+The completed [fiducial movie](output/thruster/injection/open/eta_0.001/thruster_injection_openbc_256x128_L36x24_rho_bg0.01_mdot0.01_J0.75128226_omega0.05_cycles10_rate0.02_etaBuffer0.001_outflow.mp4)
+contains all 321 saved frames at 20 fps: 16.05 s at 1700 x 1200 pixels.
+Its complete video stream was decoded successfully for verification.
+`--frame` selects the initial preview frame; movie export always includes
+the complete stored history. `--save` can also write a static image.
+
+The solver's body force integrates gas pressure plus Maxwell stress over all
+fluid/solid faces. The impermeable wall carries no advected mass flux. With
+outward body normal `n`, the code-unit traction is
+
+```text
+F_body = -integral [ (p + B^2/2) I - B B ] dot n dA
+T = -F_body,x
+mean T = -Delta(solid_impulse_x) / Delta(time)
+```
+
+This includes magnetic pressure and tension; it is not a separate measurement
+of reconnection thrust. The opposite force is the holding support's reaction.
+The cumulative impulse includes every RK timestep, which is more accurate
+for averages than integrating the sparse last-step force samples.
+
+For a specified window, feed-based specific impulse is
+
+```text
+Isp = thrust impulse / (g0 * injected propellant mass)
+    = mean thrust / (g0 * mean propellant mass flow)
+g0 = 9.80665 m/s^2
+```
+
+Use SI quantities and integrate numerator and denominator over the same
+window, rather than averaging instantaneous ratios. See
+[NASA Glenn's specific impulse definition](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/specific-impulse/).
+This is an apparent feed-based value: the finite ambient also participates,
+even when the initial dense propellant load is disabled. A propellant
+performance measurement needs a
+balanced late-time inventory and a tracer or equivalent mass accounting to
+separate injected material from ambient and any initial load. A finite-load
+run without feeding uses the initial propellant mass expended, not a zero
+mass-flow denominator. The viewer reports body traction; it does not add
+unmodeled feed or return-circuit hardware forces.
 
 ## Numerical limitations
 
@@ -746,9 +1013,10 @@ an explicit symmetric range of -0.01 to +0.01.
 ```text
 src/main.cpp                 C++ finite-volume solver
 run.py                       Python input preparation and launcher
-input/                       Example problem definitions
+input/                       Generic example problem definitions
 plot_results.py              Harris/reconnection viewer
 plot_antenna_results.py      Antenna-focused viewer
+plot_thruster_results.py     Thruster source, density and force viewer
 compare_orszag_tang.py       Athena++ benchmark comparison
 reference/                   Compact benchmark reference data
 Makefile                     Build and smoke tests

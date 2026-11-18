@@ -77,6 +77,7 @@ def load_antenna_results(path: Path):
             "plasma_energy", "current_drive_energy_correction", "native_magnetic_energy",
             "magnetic_averaging_energy", "max_current_constraint_error",
             "max_stage_current_constraint_error", "max_abs_ct_divB",
+            "injection_energy",
         ):
             if name in source["diagnostics"]:
                 diagnostics[name] = source[f"diagnostics/{name}"][:]
@@ -228,6 +229,8 @@ def make_figure(
         expected_energy += diagnostics["absorption_energy_exchange"]
     if "boundary_energy_outflow" in diagnostics:
         expected_energy -= diagnostics["boundary_energy_outflow"]
+    if "injection_energy" in diagnostics:
+        expected_energy += diagnostics["injection_energy"]
     balance_label = (r"$W_{\rm circuit}+C_{\rm drive}+W_{\rm abs}-E_{\rm out}$"
                      if prescribed_current and "absorbing" in (boundary_x, boundary_y) else
                      r"$W_{\rm circuit}+C_{\rm drive}-E_{\rm out}$"
@@ -237,6 +240,8 @@ def make_figure(
                      r"$W_{\rm ant}+W_{\rm body}-E_{\rm out}$"
                      if "solid_constraint_energy" in diagnostics or boundary_x != "periodic" or boundary_y != "periodic"
                      else r"$\int P_{\rm ant}\,dt$")
+    if "injection_energy" in diagnostics and np.any(diagnostics["injection_energy"] != 0.0):
+        balance_label += r" $+E_{\rm feed}$"
     energy_axis.plot(times, total_change, color="black", linewidth=2.0, label=r"$\Delta E$")
     energy_axis.plot(
         times, expected_energy, color="tab:green", linestyle="--", linewidth=1.8,

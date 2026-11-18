@@ -5,3 +5,6 @@ output/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local thruster inputs are not distributed with the source code.
+input/*thruster*.py

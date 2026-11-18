@@ -55,6 +55,7 @@ struct Config {
     double absorption_width = 0.0;
     double absorption_rate = 0.5;
     double absorption_magnetic_diffusivity = 0.05;
+    std::string absorption_exterior = "ambient";
     std::array<double, 8> ambient = {1.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 };
 
@@ -69,11 +70,19 @@ struct AntennaData {
     std::size_t sample_count() const { return time.size(); }
 };
 
+struct PlasmaInjectionData {
+    std::vector<double> time, amplitude;
+    std::vector<double> mass_rate, u, v, w, specific_internal_energy;
+
+    bool enabled() const { return !time.empty(); }
+};
+
 struct SolverInput {
     Config config;
     InitialData initial;
     AntennaData antenna;
     std::vector<double> solid_mask;
+    PlasmaInjectionData injection;
 };
 
 std::string format_wall_time(double seconds) {
@@ -273,6 +282,7 @@ SolverInput read_solver_input(const std::string& filename) {
     c.absorption_width = read_optional_attribute<double>(group, "absorption_width", 0.0);
     c.absorption_rate = read_optional_attribute<double>(group, "absorption_rate", 0.5);
     c.absorption_magnetic_diffusivity = read_optional_attribute<double>(group, "absorption_magnetic_diffusivity", 0.05);
+    c.absorption_exterior = read_optional_string_attribute(group, "absorption_exterior", "ambient");
     H5Gclose(group);
 
     const bool absorbing = c.boundary_x == "absorbing" || c.boundary_y == "absorbing";
@@ -334,6 +344,19 @@ SolverInput read_solver_input(const std::string& filename) {
         if (!any_fluid) throw std::runtime_error("The solid mask must leave at least one fluid cell");
         if (!any_solid) solid_mask.clear();
     }
+    PlasmaInjectionData injection;
+    const htri_t injection_exists = H5Lexists(file, "/plasma_injection", H5P_DEFAULT);
+    h5_check(injection_exists, "checking for /plasma_injection");
+    if (injection_exists > 0) {
+        injection.time = read_1d_dataset(file, "/plasma_injection/time");
+        injection.amplitude = read_1d_dataset(file, "/plasma_injection/amplitude");
+        injection.mass_rate = read_2d_dataset(file, "/plasma_injection/mass_rate", c.ny, c.nx);
+        injection.u = read_2d_dataset(file, "/plasma_injection/u", c.ny, c.nx);
+        injection.v = read_2d_dataset(file, "/plasma_injection/v", c.ny, c.nx);
+        injection.w = read_2d_dataset(file, "/plasma_injection/w", c.ny, c.nx);
+        injection.specific_internal_energy = read_2d_dataset(
+            file, "/plasma_injection/specific_internal_energy", c.ny, c.nx);
+    }
     H5Fclose(file);
 
     if (c.nx < 4 || c.ny < 4 || c.lx <= 0.0 || c.ly <= 0.0) {
@@ -342,6 +365,9 @@ SolverInput read_solver_input(const std::string& filename) {
     if ((c.boundary_x != "periodic" && c.boundary_x != "outflow" && c.boundary_x != "absorbing") ||
         (c.boundary_y != "periodic" && c.boundary_y != "outflow" && c.boundary_y != "absorbing")) {
         throw std::runtime_error("boundary_x and boundary_y must be periodic, outflow, or absorbing");
+    }
+    if (c.absorption_exterior != "ambient" && c.absorption_exterior != "outflow") {
+        throw std::runtime_error("absorption_exterior must be ambient or outflow");
     }
     if (!std::isfinite(c.absorption_width) || !std::isfinite(c.absorption_rate) ||
         !std::isfinite(c.absorption_magnetic_diffusivity) || c.absorption_width < 0.0 ||
@@ -389,7 +415,51 @@ SolverInput read_solver_input(const std::string& filename) {
             throw std::runtime_error("Antenna current table contains a non-finite value");
         }
     }
-    return {c, std::move(initial), std::move(antenna), std::move(solid_mask)};
+    if (injection_exists > 0) {
+        if (injection.time.empty() || injection.time.front() != 0.0 ||
+            injection.amplitude.size() != injection.time.size()) {
+            throw std::runtime_error("Plasma injection time/amplitude must have equal nonzero lengths and start at time zero");
+        }
+        if (injection.time.size() > 1 && injection.time.back() < c.t_end) {
+            throw std::runtime_error("Plasma injection times must cover 0 <= t <= t_end");
+        }
+        for (std::size_t sample = 0; sample < injection.time.size(); ++sample) {
+            if (!std::isfinite(injection.time[sample]) ||
+                !std::isfinite(injection.amplitude[sample]) || injection.amplitude[sample] < 0.0 ||
+                (sample > 0 && !(injection.time[sample] > injection.time[sample - 1]))) {
+                throw std::runtime_error("Plasma injection times must be finite and strictly increasing; amplitudes must be finite and non-negative");
+            }
+        }
+        const double peak_amplitude = *std::max_element(injection.amplitude.begin(), injection.amplitude.end());
+        for (std::size_t cell = 0; cell < injection.mass_rate.size(); ++cell) {
+            const double q = injection.mass_rate[cell], e = injection.specific_internal_energy[cell];
+            if (!std::isfinite(q) || q < 0.0 || !std::isfinite(e) || e < 0.0 ||
+                !std::isfinite(injection.u[cell]) || !std::isfinite(injection.v[cell]) ||
+                !std::isfinite(injection.w[cell]) || (q > 0.0 && e <= 0.0)) {
+                throw std::runtime_error("Plasma injection requires finite non-negative mass rate, finite velocity, and positive specific internal energy wherever mass is added");
+            }
+            if (q > 0.0 && !solid_mask.empty() && solid_mask[cell] != 0.0) {
+                throw std::runtime_error("Plasma injection mass rate must be zero inside stationary solids");
+            }
+            if (q > 0.0 && c.antenna_model == "prescribed_current" && injection.w[cell] != 0.0) {
+                throw std::runtime_error("prescribed_current plasma injection requires planar injection velocity w=0");
+            }
+            if (q > 0.0) {
+                const double kinetic = 0.5 * (injection.u[cell] * injection.u[cell] +
+                    injection.v[cell] * injection.v[cell] + injection.w[cell] * injection.w[cell]);
+                if (!std::isfinite(q * injection.u[cell]) || !std::isfinite(q * injection.v[cell]) ||
+                    !std::isfinite(q * injection.w[cell]) || !std::isfinite(q * (e + kinetic)) ||
+                    !std::isfinite(peak_amplitude * q) ||
+                    !std::isfinite(peak_amplitude * (q * injection.u[cell])) ||
+                    !std::isfinite(peak_amplitude * (q * injection.v[cell])) ||
+                    !std::isfinite(peak_amplitude * (q * injection.w[cell])) ||
+                    !std::isfinite(peak_amplitude * (q * (e + kinetic)))) {
+                    throw std::runtime_error("Plasma injection conservative source overflows");
+                }
+            }
+        }
+    }
+    return {c, std::move(initial), std::move(antenna), std::move(solid_mask), std::move(injection)};
 }
 
 class ParallelExecutor {
@@ -478,7 +548,8 @@ private:
 class Hdf5Output {
 public:
     Hdf5Output(const std::string& filename, const Config& c, const AntennaData& antenna,
-               int threads_used, const std::vector<double>& solid_mask)
+               int threads_used, const std::vector<double>& solid_mask,
+               const PlasmaInjectionData& injection)
         : nx_(c.nx), ny_(c.ny) {
         const std::filesystem::path path(filename);
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
@@ -501,9 +572,12 @@ public:
         write_attribute<double>(file_, "absorption_width", c.absorption_width);
         write_attribute<double>(file_, "absorption_rate", c.absorption_rate);
         write_attribute<double>(file_, "absorption_magnetic_diffusivity", c.absorption_magnetic_diffusivity);
+        write_string_attribute(file_, "absorption_exterior", c.absorption_exterior);
         if (c.boundary_x == "absorbing" || c.boundary_y == "absorbing") {
             write_string_attribute(file_, "absorption_model",
-                "ambient HLLD far-field flux plus smooth fluid relaxation and divergence-preserving curl-form magnetic diffusion sponge; not a perfectly matched layer");
+                c.absorption_exterior == "ambient" ?
+                "ambient HLLD far-field flux plus smooth fluid relaxation and divergence-preserving curl-form magnetic diffusion sponge; not a perfectly matched layer" :
+                "extrapolated HLLD exterior flux plus smooth fluid relaxation and divergence-preserving curl-form magnetic diffusion sponge; not a characteristic nonreflecting condition or perfectly matched layer");
             write_string_attribute(file_, "absorption_energy_definition",
                 "signed energy supplied to the computational domain by the artificial absorber; magnetic damping preserves local thermal pressure");
             const hid_t boundary_group = h5_id(H5Gcreate2(file_, "boundary", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "creating boundary group");
@@ -517,6 +591,25 @@ public:
         const double antenna_sample_interval = antenna.sample_count() > 1
             ? antenna.time[1] - antenna.time[0] : 0.0;
         write_attribute<double>(file_, "antenna_sample_interval", antenna_sample_interval);
+        write_attribute<int>(file_, "plasma_injection_enabled", injection.enabled() ? 1 : 0);
+        if (injection.enabled()) {
+            const hid_t group = h5_id(H5Gcreate2(file_, "plasma_injection", H5P_DEFAULT,
+                H5P_DEFAULT, H5P_DEFAULT), "creating plasma injection group");
+            write_string_attribute(group, "definition",
+                "volumetric conservative source in fluid cells: S_rho=q, S_m=q*v_inj, S_E=q*(specific_internal_energy+|v_inj|^2/2); q=mass_rate*amplitude(t); no magnetic source");
+            write_string_attribute(group, "time_definition",
+                "amplitude is linearly interpolated; a single sample at t=0 is constant for the entire run");
+            write_string_attribute(group, "accounting_definition",
+                "injection_mass, injection_momentum_x/y/z and injection_energy are cumulative source integrals over all RK stages, excluding the initial state");
+            H5Gclose(group);
+            write_fixed_1d("plasma_injection/time", injection.time);
+            write_fixed_1d("plasma_injection/amplitude", injection.amplitude);
+            write_fixed_2d("plasma_injection/mass_rate", injection.mass_rate);
+            write_fixed_2d("plasma_injection/u", injection.u);
+            write_fixed_2d("plasma_injection/v", injection.v);
+            write_fixed_2d("plasma_injection/w", injection.w);
+            write_fixed_2d("plasma_injection/specific_internal_energy", injection.specific_internal_energy);
+        }
         write_attribute<int>(file_, "solid_enabled", solid_mask.empty() ? 0 : 1);
         if (!solid_mask.empty()) {
             write_string_attribute(file_, "solid_model",
@@ -660,7 +753,8 @@ private:
             "boundary_energy_outflow", "boundary_mass_outflow", "solid_force_x", "solid_force_y",
             "solid_force_z", "solid_impulse_x", "solid_impulse_y", "solid_impulse_z", "max_wall_mass_flux",
             "absorption_energy_exchange", "absorption_mass_exchange",
-            "absorption_momentum_exchange_x", "absorption_momentum_exchange_y", "absorption_momentum_exchange_z"
+            "absorption_momentum_exchange_x", "absorption_momentum_exchange_y", "absorption_momentum_exchange_z",
+            "injection_mass", "injection_momentum_x", "injection_momentum_y", "injection_momentum_z", "injection_energy"
         };
         return names;
     }
@@ -674,6 +768,17 @@ private:
         const herr_t status = H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
         H5Dclose(dataset); H5Sclose(space);
         h5_check(status, "writing coordinate " + name);
+    }
+
+    void write_fixed_2d(const std::string& name, const std::vector<double>& values) {
+        const hsize_t dimensions[2] = {static_cast<hsize_t>(ny_), static_cast<hsize_t>(nx_)};
+        const hid_t space = h5_id(H5Screate_simple(2, dimensions, nullptr), "creating fixed field space");
+        const hid_t dataset = h5_id(H5Dcreate2(file_, name.c_str(), H5T_IEEE_F64LE, space,
+            H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), "creating fixed field " + name);
+        const herr_t status = H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL,
+            H5P_DEFAULT, values.data());
+        H5Dclose(dataset); H5Sclose(space);
+        h5_check(status, "writing fixed field " + name);
     }
 
     hid_t create_series(const std::string& name, hid_t location = -1) {
@@ -745,14 +850,36 @@ struct Primitive {
 
 class Solver {
 public:
-    Solver(Config config, InitialData initial, AntennaData antenna, std::vector<double> solid_mask)
+    Solver(Config config, InitialData initial, AntennaData antenna, std::vector<double> solid_mask,
+           PlasmaInjectionData injection = {})
         : c_(std::move(config)), dx_(c_.lx / c_.nx), dy_(c_.ly / c_.ny),
           periodic_x_(c_.boundary_x == "periodic"), periodic_y_(c_.boundary_y == "periodic"),
           absorbing_(c_.boundary_x == "absorbing" || c_.boundary_y == "absorbing"),
           cells_(static_cast<std::size_t>(c_.nx * c_.ny)), antenna_(std::move(antenna)),
-          solid_mask_(std::move(solid_mask)),
+          injection_(std::move(injection)), solid_mask_(std::move(solid_mask)),
           executor_(c_.requested_threads) {
         initialize(initial);
+        if (injection_.enabled()) {
+            injection_source_.resize(cells_.size());
+            for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
+                const double q = injection_.mass_rate[cell];
+                if (q == 0.0) continue;
+                State& source = injection_source_[cell];
+                source[rho] = q;
+                source[mx] = q * injection_.u[cell];
+                source[my] = q * injection_.v[cell];
+                source[mz] = q * injection_.w[cell];
+                source[total_energy] = q * (injection_.specific_internal_energy[cell] +
+                    0.5 * (injection_.u[cell] * injection_.u[cell] +
+                           injection_.v[cell] * injection_.v[cell] + injection_.w[cell] * injection_.w[cell]));
+                for (std::size_t k = 0; k < nvar; ++k)
+                    injection_total_rate_[k] += source[k] * dx_ * dy_;
+            }
+            if (!std::all_of(injection_total_rate_.begin(), injection_total_rate_.end(),
+                            [](double value) { return std::isfinite(value); })) {
+                throw std::runtime_error("Integrated plasma injection source overflows");
+            }
+        }
         if (!solid_mask_.empty()) {
             solid_density_ = initial.rho;
             solid_thermal_energy_.resize(cells_.size());
@@ -791,7 +918,7 @@ public:
     }
 
     void run(const std::string& output_filename) {
-        Hdf5Output output(output_filename, c_, antenna_, executor_.thread_count(), solid_mask_);
+        Hdf5Output output(output_filename, c_, antenna_, executor_.thread_count(), solid_mask_, injection_);
         std::cout << "Running on " << c_.nx << 'x' << c_.ny << " cells with "
                   << executor_.thread_count() << " threads, eta=" << c_.resistivity
                   << ", antenna=" << (antenna_.enabled() ? "on" : "off") << '\n';
@@ -813,6 +940,11 @@ public:
                 const double tol = 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(time));
                 const auto knot = std::upper_bound(antenna_.time.begin(), antenna_.time.end(), time + tol);
                 if (knot != antenna_.time.end()) dt = std::min(dt, *knot - time);
+            }
+            if (injection_.enabled() && injection_.time.size() > 1) {
+                const double tol = 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(time));
+                const auto knot = std::upper_bound(injection_.time.begin(), injection_.time.end(), time + tol);
+                if (knot != injection_.time.end()) dt = std::min(dt, *knot - time);
             }
             if (!(dt > 0.0) || !std::isfinite(dt)) throw std::runtime_error("Invalid time step");
 
@@ -859,6 +991,9 @@ private:
     bool periodic_x_, periodic_y_, absorbing_;
     std::vector<State> cells_;
     AntennaData antenna_;
+    PlasmaInjectionData injection_;
+    std::vector<State> injection_source_;
+    State injection_total_rate_{}, injection_integral_{};
     std::vector<double> solid_mask_, solid_density_, solid_thermal_energy_;
     std::vector<double> absorption_profile_;
     double max_absorption_profile_ = 0.0;
@@ -881,8 +1016,26 @@ private:
         double antenna_power = 0.0;
         double boundary_energy = 0.0, boundary_mass = 0.0;
         std::array<double, 3> solid_force{};
+        State injection_rate{};
         double max_wall_mass_flux = 0.0;
     };
+
+    double injection_amplitude(double time) const {
+        if (!injection_.enabled()) return 0.0;
+        if (injection_.time.size() == 1 || time <= injection_.time.front())
+            return injection_.amplitude.front();
+        if (time >= injection_.time.back()) return injection_.amplitude.back();
+        const auto upper = std::upper_bound(injection_.time.begin(), injection_.time.end(), time);
+        const std::size_t hi = static_cast<std::size_t>(upper - injection_.time.begin()), lo = hi - 1;
+        const double fraction = (time - injection_.time[lo]) /
+                                (injection_.time[hi] - injection_.time[lo]);
+        return (1.0 - fraction) * injection_.amplitude[lo] + fraction * injection_.amplitude[hi];
+    }
+
+    void accumulate_injection(double dt, const RhsRates& rates0, const RhsRates& rates1) {
+        for (std::size_t k = 0; k < nvar; ++k)
+            injection_integral_[k] += 0.5 * dt * (rates0.injection_rate[k] + rates1.injection_rate[k]);
+    }
 
     bool is_solid(std::size_t cell) const {
         return !solid_mask_.empty() && solid_mask_[cell] == 1.0;
@@ -1396,7 +1549,11 @@ private:
             const Primitive pi = primitive(interior);
             const double normal_velocity = direction == 0 ? pi.u : pi.v;
             const double outward_velocity = (lower_face ? -1.0 : 1.0) * normal_velocity;
-            State exterior = outward_velocity >= fast_speed(pi, direction) ? interior : ambient_state();
+            // The exterior-face choice is independent of the volume sponge.
+            // Extrapolation passes the interior state without restoring it to
+            // the ambient reservoir; it is not a characteristic wave boundary.
+            State exterior = (c_.absorption_exterior == "outflow" ||
+                outward_velocity >= fast_speed(pi, direction)) ? interior : ambient_state();
             const Primitive pe = primitive(exterior);
             // The GLM normal-field pair is extrapolated together.  Resetting
             // psi alone would launch a cleaning-wave reflection.  Rebuild E
@@ -1511,6 +1668,11 @@ private:
     std::vector<State> right_hand_side(const std::vector<State>& data, double ch,
                                        double time, RhsRates& rates) {
         rates = RhsRates{};
+        const double injection_factor = injection_amplitude(time);
+        if (injection_.enabled()) {
+            for (std::size_t k = 0; k < nvar; ++k)
+                rates.injection_rate[k] = injection_factor * injection_total_rate_[k];
+        }
         std::vector<State> sx(data.size()), sy(data.size());
         executor_.for_each(data.size(), [&](std::size_t cell) {
             const int i = static_cast<int>(cell % static_cast<std::size_t>(c_.nx));
@@ -1529,7 +1691,8 @@ private:
 
         // Interior arrays store each cell's right/top face.  The left/bottom
         // nonperiodic faces are distinct faces, not the first interior face.
-        // Outflow uses zero-gradient states; absorbing uses ambient HLLD.
+        // Outflow uses zero-gradient states; absorbing uses its selected
+        // exterior state with the same HLLD face solver.
         std::vector<State> left_boundary_flux, lower_boundary_flux;
         if (!periodic_x_) {
             left_boundary_flux.resize(static_cast<std::size_t>(c_.ny));
@@ -1601,6 +1764,11 @@ private:
                 const State source = antenna_source(data, i, j, antenna);
                 for (std::size_t k = 0; k < nvar; ++k) rhs[cell][k] += source[k];
                 antenna_power_density[cell] = source[total_energy];
+            }
+            if (injection_.enabled()) {
+                const State& source = injection_source_[cell];
+                for (std::size_t k = 0; k < nvar; ++k)
+                    rhs[cell][k] += injection_factor * source[k];
             }
         });
         if (!current_operator_) {
@@ -1958,6 +2126,7 @@ private:
         last_circuit_power_ = 0.5 * (rates0.antenna_power + rates1.antenna_power);
         boundary_energy_outflow_ += 0.5 * dt * (rates0.boundary_energy + rates1.boundary_energy);
         boundary_mass_outflow_ += 0.5 * dt * (rates0.boundary_mass + rates1.boundary_mass);
+        accumulate_injection(dt, rates0, rates1);
         for (int component = 0; component < 3; ++component) {
             solid_force_[component] = 0.5 * (rates0.solid_force[component] + rates1.solid_force[component]);
             solid_impulse_[component] += dt * solid_force_[component];
@@ -2001,6 +2170,7 @@ private:
         antenna_energy_injected_ += 0.5 * dt * (rates0.antenna_power + rates1.antenna_power);
         boundary_energy_outflow_ += 0.5 * dt * (rates0.boundary_energy + rates1.boundary_energy);
         boundary_mass_outflow_ += 0.5 * dt * (rates0.boundary_mass + rates1.boundary_mass);
+        accumulate_injection(dt, rates0, rates1);
         if (!solid_mask_.empty()) {
             for (std::size_t cell = 0; cell < cells_.size(); ++cell) {
                 solid_constraint_energy_ += (0.5 * stage_constraint[cell] + final_constraint[cell]) * dx_ * dy_;
@@ -2142,7 +2312,12 @@ private:
             {"absorption_mass_exchange", absorption_mass_exchange_},
             {"absorption_momentum_exchange_x", absorption_momentum_exchange_[0]},
             {"absorption_momentum_exchange_y", absorption_momentum_exchange_[1]},
-            {"absorption_momentum_exchange_z", absorption_momentum_exchange_[2]}
+            {"absorption_momentum_exchange_z", absorption_momentum_exchange_[2]},
+            {"injection_mass", injection_integral_[rho]},
+            {"injection_momentum_x", injection_integral_[mx]},
+            {"injection_momentum_y", injection_integral_[my]},
+            {"injection_momentum_z", injection_integral_[mz]},
+            {"injection_energy", injection_integral_[total_energy]}
         };
         std::map<std::string, std::vector<double>> nodes;
         if (current_operator_) {
@@ -2174,7 +2349,7 @@ int main(int argc, char** argv) {
         }
         SolverInput input = read_solver_input(argv[1]);
         Solver solver(std::move(input.config), std::move(input.initial), std::move(input.antenna),
-                      std::move(input.solid_mask));
+                      std::move(input.solid_mask), std::move(input.injection));
         solver.run(argv[2]);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

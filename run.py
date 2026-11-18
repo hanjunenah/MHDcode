@@ -37,13 +37,16 @@ SOLVER_DEFAULTS = {
     "absorption_width": 0.0,
     "absorption_rate": 0.5,
     "absorption_magnetic_diffusivity": 0.05,
+    "absorption_exterior": "ambient",
 }
 OUTPUT_DEFAULTS = {"file": "output/results.h5", "interval": 0.1}
 FLUID_KEYS = {"rho", "u", "v", "w", "p"}
 ANTENNA_KEYS = {"field", "space_profile", "time_profile", "space_time_profile"}
 ANTENNA_COMPONENT = {"Jx": 0, "Jy": 1, "Jz": 2}
+INJECTION_KEYS = {"mass_rate", "u", "v", "w", "specific_internal_energy",
+                  "time_profile", "sampling_interval"}
 BOUNDARY_AMBIENT_KEYS = FLUID_KEYS | {"Bx", "By", "Bz"}
-OPTIONAL_METADATA_GROUPS = ("physical_scaling", "antenna_hardware")
+OPTIONAL_METADATA_GROUPS = ("physical_scaling", "antenna_hardware", "plasma_loading")
 
 
 def load_problem(path: Path) -> ModuleType:
@@ -249,6 +252,80 @@ def prepare_antennas(
     )
 
 
+def prepare_plasma_injection(
+    problem: ModuleType, destination: h5py.File,
+    x_grid: np.ndarray, y_grid: np.ndarray, shape: tuple[int, int],
+    t_end: float, solid: np.ndarray | None, antenna_model: str,
+) -> None:
+    """Sample an optional conservative mass source, with its own feed state.
+
+    mass_rate is density/time, multiplied by the nonnegative time_profile.
+    Injected momentum and total energy follow the feed velocity and specific
+    internal energy; magnetic field is not supplied by this source.
+    """
+    raw = getattr(problem, "plasma_injection", None)
+    if raw is None:
+        return
+    supplied = checked_dictionary("plasma_injection", raw, INJECTION_KEYS)
+    for name in ("mass_rate", "specific_internal_energy"):
+        if name not in supplied:
+            raise ValueError(f"plasma_injection must provide {name}")
+    profiles = {
+        name: profile_array(evaluate_profile(supplied.get(name, 0.0), x_grid, y_grid),
+                            shape, f"plasma_injection.{name}")
+        for name in ("mass_rate", "u", "v", "w", "specific_internal_energy")
+    }
+    rate, internal = profiles["mass_rate"], profiles["specific_internal_energy"]
+    active = rate > 0.0
+    if np.any(rate < 0.0):
+        raise ValueError("plasma_injection.mass_rate must be nonnegative")
+    if np.any(internal < 0.0) or np.any(internal[active] <= 0.0):
+        raise ValueError("plasma_injection.specific_internal_energy must be nonnegative and positive where mass is injected")
+    if solid is not None and np.any(active & solid):
+        raise ValueError("plasma_injection must not add mass inside stationary solid cells")
+    if antenna_model == "prescribed_current" and np.any(profiles["w"][active] != 0.0):
+        raise ValueError("prescribed_current requires planar plasma injection (w=0)")
+    with np.errstate(over="ignore", invalid="ignore"):
+        feed_energy = internal+0.5*sum(profiles[k]**2 for k in ("u", "v", "w"))
+        source_energy = rate*feed_energy
+    if not np.all(np.isfinite(feed_energy)) or not np.all(np.isfinite(source_energy)):
+        raise ValueError("plasma_injection feed energy or source overflows")
+    if not np.isfinite(t_end) or t_end < 0.0:
+        raise ValueError("plasma_injection requires finite nonnegative t_end")
+    temporal = supplied.get("time_profile", 1.0)
+    sampling = supplied.get("sampling_interval")
+    if sampling is not None:
+        sampling = float(sampling)
+        if not np.isfinite(sampling) or sampling <= 0.0:
+            raise ValueError("plasma_injection.sampling_interval must be finite and positive")
+    if callable(temporal):
+        if sampling is None:
+            raise ValueError("A time-dependent plasma_injection requires a positive sampling_interval")
+        intervals = max(1, int(np.ceil(t_end/sampling)))
+        times = np.linspace(0.0, t_end, intervals+1) if t_end > 0.0 else np.array([0.0])
+        amplitude = temporal_profile_array(temporal, times, "plasma_injection.time_profile")
+    else:
+        times = np.array([0.0])
+        amplitude = temporal_profile_array(temporal, times, "plasma_injection.time_profile")
+    if np.any(amplitude < 0.0):
+        raise ValueError("plasma_injection.time_profile must be nonnegative")
+    with np.errstate(over="ignore", invalid="ignore"):
+        max_source = max(float(np.max(rate)), float(np.max(source_energy)),
+                         *(float(np.max(np.abs(rate*profiles[k]))) for k in ("u", "v", "w")))
+        peak_source = max_source*float(np.max(amplitude))
+    if not np.isfinite(peak_source):
+        raise ValueError("plasma_injection source amplitude overflows")
+    group = destination.create_group("plasma_injection")
+    group.attrs["definition"] = (
+        "nonnegative density/time source times interpolated amplitude; feed velocity and specific internal energy supply conservative momentum and total energy; no magnetic source"
+    )
+    group.create_dataset("time", data=times)
+    group.create_dataset("amplitude", data=amplitude)
+    for name, values in profiles.items():
+        group.create_dataset(name, data=values)
+    print(f"Prepared plasma injection: {times.size} temporal samples, peak mass rate {np.max(rate)*np.max(amplitude):.6g}", flush=True)
+
+
 def periodic_curl(
     magnetic: tuple[np.ndarray, np.ndarray, np.ndarray], dx: float, dy: float,
     boundary_x: str = "periodic", boundary_y: str = "periodic",
@@ -352,6 +429,8 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
     for name in ("boundary_x", "boundary_y"):
         if solver[name] not in ("periodic", "outflow", "absorbing"):
             raise ValueError(f"solver {name} must be 'periodic', 'outflow', or 'absorbing'")
+    if solver["absorption_exterior"] not in ("ambient", "outflow"):
+        raise ValueError("solver absorption_exterior must be 'ambient' or 'outflow'")
     absorbing = any(solver[name] == "absorbing" for name in ("boundary_x", "boundary_y"))
     for name in ("absorption_width", "absorption_rate", "absorption_magnetic_diffusivity"):
         solver[name] = float(solver[name])
@@ -481,6 +560,8 @@ def prepare_input(problem: ModuleType, filename: Path, t_end_override: float | N
             ambient_group = destination.create_group("boundary/ambient")
             for name, value in ambient.items():
                 ambient_group.attrs[name] = value
+        prepare_plasma_injection(problem, destination, x_grid, y_grid, shape,
+                                 float(solver["t_end"]), solid, solver["antenna_model"])
         prepare_antennas(problem, destination, x_grid, y_grid, shape, float(solver["t_end"]))
     return Path(output["file"])
 
